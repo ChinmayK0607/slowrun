@@ -90,7 +90,7 @@ SCALAR_LR = BASE_SCALAR_LR * _lr_mult
 WEIGHT_DECAY = args.weight_decay
 ADAM_BETAS = (0.8, 0.95)
 WARMUP_RATIO = 0.0
-WARMDOWN_RATIO = 0.5
+WARMDOWN_RATIO = 0.6
 FINAL_LR_FRAC = 0.0
 
 # =============================================================================
@@ -788,7 +788,13 @@ def get_lr_multiplier_tokens(tokens_consumed, total_tokens):
         return max(0.0, progress + (1 - progress) * FINAL_LR_FRAC)
 
 def get_muon_momentum(it):
-    return (1 - min(it / 300, 1)) * 0.85 + min(it / 300, 1) * 0.95
+    warmup = (1 - min(it / 300, 1)) * 0.85 + min(it / 300, 1) * 0.95
+    cooldown_steps = 50
+    cooldown_start = num_iterations - cooldown_steps
+    if it >= cooldown_start:
+        frac = (it - cooldown_start) / cooldown_steps
+        return 0.95 - frac * 0.10
+    return warmup
 
 # Training loop
 step = 0
