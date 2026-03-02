@@ -51,6 +51,8 @@ parser.add_argument("--input_val_bin", type=str, default=None)
 parser.add_argument("--output_json", type=str, default=None)
 parser.add_argument("--wandb_group", type=str, default=None)
 parser.add_argument("--dropout", type=float, default=0.1)
+parser.add_argument("--batch-schedule", action="store_true", default=False,
+                    help="Enable 3-stage batch size ramp (0.5x -> 1x -> 1.5x total_batch_size)")
 args = parser.parse_args()
 
 # Resolve output path
@@ -710,9 +712,42 @@ x, y, current_epoch = next(train_loader)
 # Training config
 tokens_per_fwdbwd = args.device_batch_size * MAX_SEQ_LEN * ddp_world_size
 assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
-grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
-num_iterations = round(TOKENS_PER_EPOCH * args.num_epochs / TOTAL_BATCH_SIZE)  # estimate for LR schedule
-print0(f"Batch size: {TOTAL_BATCH_SIZE:,} tokens, grad accum: {grad_accum_steps} steps")
+base_grad_accum = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
+
+# Batch size schedule: ramp from small -> medium -> large over 3 equal epoch stages.
+# Rationale: small batches are more token-efficient early; large batches are faster later.
+# LR scales with batch size: lr_scale = (batch_ratio)^exponent (empirical, from modded-nanogpt).
+if args.batch_schedule and args.num_epochs >= 3:
+    _n = args.num_epochs
+    _e1 = _n // 3
+    _e2 = _n // 3
+    _ga_small = max(1, base_grad_accum // 2)
+    _ga_med   = base_grad_accum
+    _ga_large = base_grad_accum + base_grad_accum // 2
+    _batch_stages = [
+        (1,               _e1,          _ga_small, 1.0),        # 0.5x batch, base LR
+        (_e1 + 1,         _e1 + _e2,    _ga_med,   2 ** 0.6),   # 1.0x batch, ~1.52x LR
+        (_e1 + _e2 + 1,   _n,           _ga_large, 3 ** 0.5),   # 1.5x batch, ~1.73x LR
+    ]
+    num_iterations = 0
+    for _s, _e, _ga, _ in _batch_stages:
+        _n_ep = _e - _s + 1
+        num_iterations += round(TOKENS_PER_EPOCH * _n_ep / (_ga * tokens_per_fwdbwd))
+    def get_batch_stage(epoch):
+        for s, e, ga, lr_s in _batch_stages:
+            if s <= epoch <= e:
+                return ga, lr_s
+        return _batch_stages[-1][2], _batch_stages[-1][3]
+    print0(f"Batch schedule enabled (3 stages):")
+    for i, (s, e, ga, lr_s) in enumerate(_batch_stages):
+        print0(f"  Stage {i+1}: epochs {s}-{e}, batch={ga * tokens_per_fwdbwd:,} tok, grad_accum={ga}, lr_scale={lr_s:.3f}")
+else:
+    num_iterations = round(TOKENS_PER_EPOCH * args.num_epochs / TOTAL_BATCH_SIZE)
+    def get_batch_stage(_epoch):
+        return base_grad_accum, 1.0
+
+grad_accum_steps = base_grad_accum  # initial value
+print0(f"Base batch size: {TOTAL_BATCH_SIZE:,} tokens, grad accum: {base_grad_accum} steps")
 print0(f"Training for {args.num_epochs} epoch(s) (~{num_iterations} steps estimated)")
 print0(f"Eval set: {EVAL_TOKENS:,} tokens")
 
@@ -750,18 +785,22 @@ min_val_loss = val_loss
 model.train()
 
 while current_epoch <= args.num_epochs:
+    # Get batch schedule for current epoch
+    current_ga, current_lr_scale = get_batch_stage(current_epoch)
+    current_batch_size = current_ga * tokens_per_fwdbwd
+
     # Training step
     synchronize()
     t0 = time.time()
-    for micro_step in range(grad_accum_steps):
+    for micro_step in range(current_ga):
         with autocast_ctx:
             loss = model(x, y)
         train_loss = loss.detach()
-        (loss / grad_accum_steps).backward()
+        (loss / current_ga).backward()
         x, y, epoch = next(train_loader)
 
     # Update optimizer
-    lrm = get_lr_multiplier(step)
+    lrm = get_lr_multiplier(step) * current_lr_scale
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm
         if group['kind'] == 'muon':
@@ -779,8 +818,8 @@ while current_epoch <= args.num_epochs:
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
     debiased = smooth_train_loss / (1 - ema_beta**step)
     pct = 100 * step / num_iterations
-    tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
-    mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / (gpu_peak_flops * ddp_world_size)
+    tok_per_sec = int(current_batch_size / dt)
+    mfu = 100 * num_flops_per_token * current_batch_size / dt / (gpu_peak_flops * ddp_world_size)
     if step > 10:
         total_training_time += dt
     steps_done = step - 10
