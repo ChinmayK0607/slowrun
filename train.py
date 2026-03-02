@@ -354,12 +354,16 @@ polar_express_coeffs = [
 
 @torch.compile(dynamic=False, fullgraph=True)
 def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t):
-    p.mul_(1 - lr_t * wd_t)
     exp_avg.lerp_(grad, 1 - beta1_t)
     exp_avg_sq.lerp_(grad.square(), 1 - beta2_t)
     bias1 = 1 - beta1_t ** step_t
     bias2 = 1 - beta2_t ** step_t
-    p.add_(exp_avg / ((exp_avg_sq / bias2).sqrt() + eps_t), alpha=-(lr_t / bias1))
+    step_size = lr_t / bias1
+    update = exp_avg / ((exp_avg_sq / bias2).sqrt() + eps_t)
+    # Cautious weight decay: only decay where update and param agree in sign
+    mask = (update * p) > 0
+    update.add_(p * mask, alpha=wd_t)
+    p.add_(update, alpha=-step_size)
 
 @torch.compile(dynamic=False, fullgraph=True)
 def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momentum_buffer,
@@ -715,8 +719,9 @@ assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
 base_grad_accum = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
 
 # Batch size schedule: ramp from small -> medium -> large over 3 equal epoch stages.
-# Rationale: small batches are more token-efficient early; large batches are faster later.
-# LR scales with batch size: lr_scale = (batch_ratio)^exponent (empirical, from modded-nanogpt).
+# Rationale: small batches give more gradient updates per token early (better exploration);
+# large batches are more compute-efficient later (faster wall-clock convergence).
+# LR schedule uses token-based warmdown (not step-based) to stay smooth across stage transitions.
 if args.batch_schedule and args.num_epochs >= 3:
     _n = args.num_epochs
     _e1 = _n // 3
@@ -725,24 +730,30 @@ if args.batch_schedule and args.num_epochs >= 3:
     _ga_med   = base_grad_accum
     _ga_large = base_grad_accum + base_grad_accum // 2
     _batch_stages = [
-        (1,               _e1,          _ga_small, 1.0),        # 0.5x batch, base LR
-        (_e1 + 1,         _e1 + _e2,    _ga_med,   2 ** 0.6),   # 1.0x batch, ~1.52x LR
-        (_e1 + _e2 + 1,   _n,           _ga_large, 3 ** 0.5),   # 1.5x batch, ~1.73x LR
+        (1,               _e1,          _ga_small),   # 0.5x batch
+        (_e1 + 1,         _e1 + _e2,    _ga_med),     # 1.0x batch
+        (_e1 + _e2 + 1,   _n,           _ga_large),   # 1.5x batch
     ]
     num_iterations = 0
-    for _s, _e, _ga, _ in _batch_stages:
+    for _s, _e, _ga in _batch_stages:
         _n_ep = _e - _s + 1
         num_iterations += round(TOKENS_PER_EPOCH * _n_ep / (_ga * tokens_per_fwdbwd))
+    # Total tokens for token-based LR schedule
+    _total_train_tokens = TOKENS_PER_EPOCH * args.num_epochs
+    _tokens_consumed = 0  # tracked during training
     def get_batch_stage(epoch):
-        for s, e, ga, lr_s in _batch_stages:
+        for s, e, ga in _batch_stages:
             if s <= epoch <= e:
-                return ga, lr_s
-        return _batch_stages[-1][2], _batch_stages[-1][3]
-    print0(f"Batch schedule enabled (3 stages):")
-    for i, (s, e, ga, lr_s) in enumerate(_batch_stages):
-        print0(f"  Stage {i+1}: epochs {s}-{e}, batch={ga * tokens_per_fwdbwd:,} tok, grad_accum={ga}, lr_scale={lr_s:.3f}")
+                return ga, 1.0
+        return _batch_stages[-1][2], 1.0
+    print0(f"Batch schedule enabled (3 stages, token-based LR):")
+    for i, (s, e, ga) in enumerate(_batch_stages):
+        print0(f"  Stage {i+1}: epochs {s}-{e}, batch={ga * tokens_per_fwdbwd:,} tok, grad_accum={ga}")
+    print0(f"  Total tokens: {_total_train_tokens:,}, warmdown over last 50% of tokens")
 else:
     num_iterations = round(TOKENS_PER_EPOCH * args.num_epochs / TOTAL_BATCH_SIZE)
+    _total_train_tokens = 0  # not used
+    _tokens_consumed = 0     # not used
     def get_batch_stage(_epoch):
         return base_grad_accum, 1.0
 
@@ -753,6 +764,7 @@ print0(f"Eval set: {EVAL_TOKENS:,} tokens")
 
 # Schedulers
 def get_lr_multiplier(it):
+    """Step-based LR schedule (used when batch schedule is OFF)."""
     warmup = round(WARMUP_RATIO * num_iterations)
     warmdown = round(WARMDOWN_RATIO * num_iterations)
     if it < warmup: return (it + 1) / warmup
@@ -760,6 +772,20 @@ def get_lr_multiplier(it):
     else:
         progress = (num_iterations - it) / warmdown
         return progress + (1 - progress) * FINAL_LR_FRAC
+
+def get_lr_multiplier_tokens(tokens_consumed, total_tokens):
+    """Token-based LR schedule (used when batch schedule is ON).
+    Warmdown is computed over tokens, so it stays smooth across batch size changes."""
+    warmup_tokens = WARMUP_RATIO * total_tokens
+    warmdown_tokens = WARMDOWN_RATIO * total_tokens
+    warmdown_start = total_tokens - warmdown_tokens
+    if tokens_consumed < warmup_tokens:
+        return (tokens_consumed + 1) / warmup_tokens if warmup_tokens > 0 else 1.0
+    elif tokens_consumed <= warmdown_start:
+        return 1.0
+    else:
+        progress = (total_tokens - tokens_consumed) / warmdown_tokens
+        return max(0.0, progress + (1 - progress) * FINAL_LR_FRAC)
 
 def get_muon_momentum(it):
     return (1 - min(it / 300, 1)) * 0.85 + min(it / 300, 1) * 0.95
@@ -799,15 +825,32 @@ while current_epoch <= args.num_epochs:
         (loss / current_ga).backward()
         x, y, epoch = next(train_loader)
 
-    # Update optimizer
-    lrm = get_lr_multiplier(step) * current_lr_scale
-    for group in optimizer.param_groups:
-        group["lr"] = group["initial_lr"] * lrm
-        if group['kind'] == 'muon':
-            group["momentum"] = get_muon_momentum(step)
-    optimizer.step()
-    model.zero_grad(set_to_none=True)
+    # NaN/Inf guard: skip optimizer step on bad gradients to prevent unrecoverable divergence
     train_loss_f = train_loss.item()
+    _bad_step = not math.isfinite(train_loss_f)
+    if ddp:
+        _bad_flag = torch.tensor([1.0 if _bad_step else 0.0], device=device)
+        dist.all_reduce(_bad_flag, op=dist.ReduceOp.MAX)
+        _bad_step = _bad_flag.item() > 0
+
+    if _bad_step:
+        model.zero_grad(set_to_none=True)
+        print0(f"  [WARN] NaN/Inf loss detected at step {step+1}, skipping optimizer update")
+    else:
+        # Update optimizer
+        # Use token-based LR schedule when batch schedule is active (smooth across batch size changes),
+        # otherwise use the original step-based schedule.
+        if args.batch_schedule and _total_train_tokens > 0:
+            _tokens_consumed += current_batch_size
+            lrm = get_lr_multiplier_tokens(_tokens_consumed, _total_train_tokens) * current_lr_scale
+        else:
+            lrm = get_lr_multiplier(step) * current_lr_scale
+        for group in optimizer.param_groups:
+            group["lr"] = group["initial_lr"] * lrm
+            if group['kind'] == 'muon':
+                group["momentum"] = get_muon_momentum(step)
+        optimizer.step()
+        model.zero_grad(set_to_none=True)
     synchronize()
     dt = time.time() - t0
 
