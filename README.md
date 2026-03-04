@@ -39,6 +39,7 @@ The limited-compute track caps runs at a single 8xH100 node for at most 1 hour.
 3 | 3.349 | Change value embed tables to projections from x0 | 03/01/26 | \~47 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/b261fba252920582076cf8c77dedf9251fe7f7ed/train.py) | [@ms337](https://x.com/madhavsinghal_)
 4 | 3.335 | Use swiglu activation | 03/01/26 | 52.1 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/22d4a24ec53633c16d643779900ac3e9d10643a3/train.py) | [@akshayvegesna](https://x.com/akshayvegesna)
 5 | 3.314 | Add U-Net architecture | 03/03/26 | 52.3 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/e463653a2b07790e0694bfaa6bdd7e6ee57cef64/train.py) | [@em-see-squared](https://github.com/em-see-squared)
+6 | 3.295 | Add gating per attention head  | 03/03/26 | 53.3 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/52e7441f862c3295c0f5695933438dac78f7fc5b/train.py) | [@akshayvegesna](https://x.com/akshayvegesna)
 
 
 ### Tiny Track (15 minutes)
