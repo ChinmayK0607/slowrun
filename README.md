@@ -62,6 +62,8 @@ The tiny track caps runs at a single 8xH100 node for at most 15 minutes.
 1 | 3.402 | Baseline: 2.7B transformer, Muon, dropout 0.1, weight decay 1.6 | 02/26/26 | \~47 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/0d49316316dc6684049a679e03958c3fb612a8fd/train.py) | [@akshayvegesna](https://x.com/akshayvegesna)
 2 | 3.264 | Baseline: 8 × 2.7B transformer, Muon, dropout 0.1, weight decay 1.6, logit averaging | 02/27/26 | 6h 44m | [Script](https://github.com/qlabs-eng/slowrun/blob/106a290604abb6d8c5b0c3cc94c3b0eb6fe87dff/unlimited/train.py) | [@akshayvegesna](https://x.com/akshayvegesna)
 3 | 3.218 | Use value projections and swiglu activation | 03/02/26 | 6h 54m | [Script](https://github.com/qlabs-eng/slowrun/blob/4681cfd6fa8266fc6cbbf2af947773e188599857/unlimited/train.py) | [@akshayvegesna](https://x.com/akshayvegesna)
+4 | 3.185 | Add U-Net and Attention Gating | 03/04/26 | 7h 8m | [Script](https://github.com/qlabs-eng/slowrun/blob/bfe12a71d84a4102dcd1a2faaedfbd9aa1c417c0/unlimited/train.py) | [@akshayvegesna](https://x.com/akshayvegesna), [@em-see-squared](https://github.com/em-see-squared)
+
 
 
 ## Why limited data, unlimited compute? 
