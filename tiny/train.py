@@ -56,6 +56,7 @@ parser.add_argument("--input_val_bin", type=str, default=None)
 parser.add_argument("--output_json", type=str, default=None)
 parser.add_argument("--wandb_group", type=str, default=None)
 parser.add_argument("--dropout", type=float, default=0.1)
+parser.add_argument("--split-embed-frac", type=float, default=0.67)
 args = parser.parse_args()
 
 # Resolve output path
@@ -274,6 +275,7 @@ class GPT(nn.Module):
         # U-Net skip connections: encoder layer i → decoder layer (n_layer - 1 - i)
         self.encoder_layers = config.n_layer // 2
         self.skip_weights = nn.Parameter(torch.ones(self.encoder_layers))
+        self.embed_tied = True  # tie wte to lm_head until split_embed_frac of training
         self.rotary_seq_len = config.sequence_len * 10
         cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim)
         self.register_buffer("cos", cos, persistent=False)
@@ -369,7 +371,10 @@ class GPT(nn.Module):
     def forward(self, idx, targets=None, loss_reduction='mean'):
         B, T = idx.size()
         cos_sin = self.cos[:, :T], self.sin[:, :T]
-        x = norm(self.transformer.wte(idx))
+        if self.embed_tied:
+            x = norm(F.embedding(idx, self.lm_head.weight).to(dtype=self.transformer.wte.weight.dtype))
+        else:
+            x = norm(self.transformer.wte(idx))
         x0 = x
         skip_connections = []
         for i, block in enumerate(self.transformer.h):
@@ -765,7 +770,9 @@ assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
 grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
 num_iterations = round(TOKENS_PER_EPOCH * args.num_epochs / TOTAL_BATCH_SIZE)  # estimate for LR schedule
 print0(f"Batch size: {TOTAL_BATCH_SIZE:,} tokens, grad accum: {grad_accum_steps} steps")
+split_step = round(args.split_embed_frac * num_iterations)
 print0(f"Training for {args.num_epochs} epoch(s) (~{num_iterations} steps estimated)")
+print0(f"Embed/LM-head tying: untie at step {split_step}/{num_iterations} ({args.split_embed_frac:.0%})")
 print0(f"Eval set: {EVAL_TOKENS:,} tokens")
 
 # Schedulers
@@ -814,6 +821,12 @@ while current_epoch <= args.num_epochs:
         (loss / grad_accum_steps).backward()
         x, y, epoch = next(train_loader)
 
+    # Embedding tying: ensure wte has zero grad while tied (not used in forward)
+    if orig_model.embed_tied:
+        wte_w = orig_model.transformer.wte.weight
+        if wte_w.grad is None:
+            wte_w.grad = torch.zeros_like(wte_w)
+
     # Update optimizer
     lrm = get_lr_multiplier(step)
     for group in optimizer.param_groups:
@@ -827,6 +840,15 @@ while current_epoch <= args.num_epochs:
     dt = time.time() - t0
 
     step += 1
+
+    # Embedding tying: untie at split step
+    if orig_model.embed_tied and step >= split_step:
+        orig_model.embed_tied = False
+        orig_model.transformer.wte.weight.data.copy_(orig_model.lm_head.weight.data)
+        for p in orig_model.transformer.wte.parameters():
+            if p in optimizer.state:
+                del optimizer.state[p]
+        print0(f"Step {step}: untied embed/lm_head weights")
 
     # Logging
     ema_beta = 0.9
