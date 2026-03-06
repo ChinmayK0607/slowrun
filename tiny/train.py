@@ -1,9 +1,10 @@
 """
 Train a language model on ~100M tokens with val loss evaluation.
 Code is based on Nanochat (https://github.com/karpathy/nanochat), with modifications to support the slowrun setting.
+Made for the Tiny Track of the NanoGPT Slowrun benchmark.
 
 Usage:
-    torchrun --standalone --nproc_per_node=8 train.py
+    torchrun --standalone --nproc_per_node=8 tiny/train.py
 """
 
 import os
@@ -24,6 +25,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from torch import Tensor
 import wandb
+
 import tiktoken
 
 _script_start = time.time()
@@ -33,26 +35,27 @@ _script_start = time.time()
 # =============================================================================
 
 parser = argparse.ArgumentParser(description="Train GPT model")
-parser.add_argument("--device-batch-size", type=int, default=4)
-parser.add_argument("--num-epochs", type=int, default=12)
+parser.add_argument("--device-batch-size", type=int, default=16)
+parser.add_argument("--num-epochs", type=int, default=16)
 parser.add_argument("--patience", type=int, default=-1)
 parser.add_argument("--run", type=str, default=None)
-parser.add_argument("--scalar-lr", type=float, default=0.5)
-parser.add_argument("--matrix-lr", type=float, default=0.08)
-parser.add_argument("--weight-decay", type=float, default=1.6)
+parser.add_argument("--scalar-lr", type=float, default=0.25)
+parser.add_argument("--matrix-lr", type=float, default=0.04)
+parser.add_argument("--embedding-lr", type=float, default=0.15)
+parser.add_argument("--unembedding-lr", type=float, default=0.001)
+parser.add_argument("--weight-decay", type=float, default=0.8)
+parser.add_argument("--warmdown-ratio", type=float, default=0.6)
 parser.add_argument("--total-batch-size", type=int, default=524288)
 parser.add_argument("--save-result", type=str, default="")
-parser.add_argument("--n_layer", type=int, default=30)
-parser.add_argument("--n_head", type=int, default=14)
-parser.add_argument("--n_embd", type=int, default=1792)
-parser.add_argument("--lr_multiplier", type=float, default=0.25)
+parser.add_argument("--n_layer", type=int, default=16)
+parser.add_argument("--n_head", type=int, default=8)
+parser.add_argument("--n_embd", type=int, default=1024)
+parser.add_argument("--lr_multiplier", type=float, default=1.0)
 parser.add_argument("--input_bin", type=str, default=None)
 parser.add_argument("--input_val_bin", type=str, default=None)
 parser.add_argument("--output_json", type=str, default=None)
 parser.add_argument("--wandb_group", type=str, default=None)
 parser.add_argument("--dropout", type=float, default=0.1)
-parser.add_argument("--batch-schedule", action="store_true", default=False,
-                    help="Enable 3-stage batch size ramp (0.5x -> 1x -> 1.5x total_batch_size)")
 args = parser.parse_args()
 
 # Resolve output path
@@ -60,10 +63,10 @@ if args.output_json and not args.save_result:
     args.save_result = args.output_json
 
 # =============================================================================
-# Hardwired d12 (GPT-2 small) hyperparameters
+# Hyperparameters
 # =============================================================================
 
-# Architecture (defaults = d12 GPT-2 small)
+# Architecture
 DEPTH = args.n_layer if args.n_layer is not None else 12
 N_EMBD = args.n_embd if args.n_embd is not None else 768
 N_HEAD = args.n_head if args.n_head is not None else 6
@@ -77,8 +80,8 @@ DATA_DIR = "fineweb_data"
 # Base optimizer hyperparameters
 BASE_MATRIX_LR = args.matrix_lr
 BASE_SCALAR_LR = args.scalar_lr
-BASE_EMBEDDING_LR = 0.3
-BASE_UNEMBEDDING_LR = 0.004
+BASE_EMBEDDING_LR = args.embedding_lr
+BASE_UNEMBEDDING_LR = args.unembedding_lr
 
 # Apply LR multiplier if provided (scales all LRs uniformly)
 _lr_mult = args.lr_multiplier if args.lr_multiplier is not None else 1.0
@@ -90,7 +93,7 @@ SCALAR_LR = BASE_SCALAR_LR * _lr_mult
 WEIGHT_DECAY = args.weight_decay
 ADAM_BETAS = (0.8, 0.95)
 WARMUP_RATIO = 0.0
-WARMDOWN_RATIO = 0.6
+WARMDOWN_RATIO = args.warmdown_ratio
 FINAL_LR_FRAC = 0.0
 
 # =============================================================================
@@ -112,7 +115,7 @@ class DummyWandb:
     def finish(self): pass
 
 # =============================================================================
-# Flash Attention (FA3 on Hopper)
+# Flash Attention (FA3 on Hopper, SDPA fallback elsewhere)
 # =============================================================================
 
 def _load_fa3():
@@ -130,9 +133,32 @@ def _load_fa3():
 
 _fa3 = _load_fa3()
 
+def _sdpa_attention(q, k, v, window_size, enable_gqa):
+    Tq, Tk = q.size(2), k.size(2)
+    window = window_size[0]
+    if (window < 0 or window >= Tq) and Tq == Tk:
+        return F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=enable_gqa)
+    if Tq == 1:
+        if window >= 0 and window < Tk:
+            start = max(0, Tk - (window + 1))
+            k, v = k[:, :, start:, :], v[:, :, start:, :]
+        return F.scaled_dot_product_attention(q, k, v, is_causal=False, enable_gqa=enable_gqa)
+    device = q.device
+    row_idx = (Tk - Tq) + torch.arange(Tq, device=device).unsqueeze(1)
+    col_idx = torch.arange(Tk, device=device).unsqueeze(0)
+    mask = col_idx <= row_idx
+    if window >= 0 and window < Tk:
+        mask = mask & ((row_idx - col_idx) <= window)
+    return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, enable_gqa=enable_gqa)
+
 def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
-    """Flash Attention for training (FA3 only). q,k,v: (B, T, H, D)."""
-    return _fa3.flash_attn_func(q, k, v, causal=causal, window_size=window_size)
+    """Flash Attention for training. q,k,v: (B, T, H, D)."""
+    if _fa3 is not None:
+        return _fa3.flash_attn_func(q, k, v, causal=causal, window_size=window_size)
+    q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+    enable_gqa = q.size(1) != k.size(1)
+    y = _sdpa_attention(q, k, v, window_size, enable_gqa)
+    return y.transpose(1, 2)
 
 flash_attn = SimpleNamespace(flash_attn_func=flash_attn_func)
 
@@ -143,13 +169,13 @@ flash_attn = SimpleNamespace(flash_attn_func=flash_attn_func)
 @dataclass
 class GPTConfig:
     sequence_len: int = MAX_SEQ_LEN
-    vocab_size: int = 50257
+    vocab_size: int = 32768
     n_layer: int = DEPTH
     n_head: int = N_HEAD
     n_kv_head: int = N_HEAD
     n_embd: int = N_EMBD
     window_pattern: str = WINDOW_PATTERN
-    dropout: float = 0.0
+    dropout: float = 0.1         
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
@@ -179,7 +205,7 @@ class CausalSelfAttention(nn.Module):
         self.resid_dropout = nn.Dropout(config.dropout)
         self.ve_gate_channels = 32
         self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
-        # Attention gate: per-head gating to enable context-based no-op
+        # Per-head attention gate: enables context-based attention no-op
         self.attn_gate_channels = 12
         self.attn_gate = nn.Linear(self.attn_gate_channels, self.n_head, bias=False)
 
@@ -197,10 +223,11 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
         y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
-        # Attention gate: per-head sigmoid gate
+        # Per-head attention gate (sparse gated attention, zero-init → sigmoid(0)=0.5 at start)
         y = y * torch.sigmoid(self.attn_gate(x[..., :self.attn_gate_channels])).unsqueeze(-1)
         y = y.contiguous().view(B, T, -1)
         return self.resid_dropout(self.c_proj(y))
+
 
 class MLP(nn.Module):
     def __init__(self, config):
@@ -209,10 +236,10 @@ class MLP(nn.Module):
         self.c_gate = nn.Linear(config.n_embd, hidden, bias=False)
         self.c_fc = nn.Linear(config.n_embd, hidden, bias=False)
         self.c_proj = nn.Linear(hidden, config.n_embd, bias=False)
-        self.resid_dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
-        return self.resid_dropout(self.c_proj(F.silu(self.c_gate(x)) * self.c_fc(x)))
+        return self.c_proj(F.silu(self.c_gate(x)) * self.c_fc(x))
+
 
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
@@ -265,10 +292,11 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.mlp.c_gate.weight, -s, s)
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
+
         self.resid_lambdas.fill_(1.0)
         self.x0_lambdas.fill_(0.1)
         for proj in self.ve_projs.values():
-            torch.nn.init.uniform_(proj.weight, -s, s)
+            torch.nn.init.uniform_(proj.weight, -s, s)  
         for block in self.transformer.h:
             if block.attn.ve_gate is not None:
                 torch.nn.init.zeros_(block.attn.ve_gate.weight)
@@ -309,8 +337,11 @@ class GPT(nn.Module):
 
     def setup_optimizer(self):
         ddp, rank, local_rank, world_size = get_dist_info()
-        matrix_params = list(self.transformer.h.parameters()) + list(self.ve_projs.parameters())
-        ve_params = []
+        # Separate attn_gate params (small, Adam-optimized) from matrix params (Muon)
+        attn_gate_params = [block.attn.attn_gate.weight for block in self.transformer.h]
+        attn_gate_ids = {id(p) for p in attn_gate_params}
+        all_h_params = list(self.transformer.h.parameters()) + list(self.ve_projs.parameters())
+        matrix_params = [p for p in all_h_params if id(p) not in attn_gate_ids]
         embed_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
@@ -320,10 +351,10 @@ class GPT(nn.Module):
         param_groups = [
             dict(kind='adamw', params=lm_head_params, lr=UNEMBEDDING_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=WEIGHT_DECAY),
             dict(kind='adamw', params=embed_params, lr=EMBEDDING_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=WEIGHT_DECAY),
-            dict(kind='adamw', params=ve_params, lr=EMBEDDING_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=WEIGHT_DECAY),
             dict(kind='adamw', params=resid_params, lr=SCALAR_LR * 0.01, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=SCALAR_LR, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=skip_params, lr=SCALAR_LR * 0.01, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=attn_gate_params, lr=SCALAR_LR, betas=(0.9, 0.99), eps=1e-10, weight_decay=0.0),
         ]
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
@@ -372,16 +403,12 @@ polar_express_coeffs = [
 
 @torch.compile(dynamic=False, fullgraph=True)
 def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t):
+    p.mul_(1 - lr_t * wd_t)
     exp_avg.lerp_(grad, 1 - beta1_t)
     exp_avg_sq.lerp_(grad.square(), 1 - beta2_t)
     bias1 = 1 - beta1_t ** step_t
     bias2 = 1 - beta2_t ** step_t
-    step_size = lr_t / bias1
-    update = exp_avg / ((exp_avg_sq / bias2).sqrt() + eps_t)
-    # Cautious weight decay: only decay where update and param agree in sign
-    mask = (update * p) > 0
-    update.add_(p * mask, alpha=wd_t)
-    p.add_(update, alpha=-step_size)
+    p.add_(exp_avg / ((exp_avg_sq / bias2).sqrt() + eps_t), alpha=-(lr_t / bias1))
 
 @torch.compile(dynamic=False, fullgraph=True)
 def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momentum_buffer,
@@ -418,6 +445,7 @@ def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momen
     wd = wd_t.to(g.dtype)
     mask = (g * stacked_params) >= 0
     stacked_params.sub_(lr * g + lr * wd * stacked_params * mask)
+
 
 class DistMuonAdamW(torch.optim.Optimizer):
     """Distributed MuonAdamW with ZeRO-2 style sharding."""
@@ -584,7 +612,7 @@ class DataLoader:
         g.manual_seed(self.epoch)
         perm = torch.randperm(self.num_steps, generator=g)
         self.rank_data = self.rank_data[perm]
-
+        
     def __next__(self):
         if self.pos >= self.num_steps:
             self.pos = 0
@@ -663,7 +691,7 @@ if device_type == "cuda":
 if _fa3 is not None:
     print0("Using Flash Attention 3 (Hopper GPU detected)")
 else:
-    raise RuntimeError("Flash Attention 3 is required but not available. A Hopper (sm90) GPU is needed.")
+    print0("Using PyTorch SDPA fallback (no FA3)")
 
 # wandb
 run_name = args.run if args.run else time.strftime("%Y%m%d_%H%M%S")
@@ -734,55 +762,14 @@ x, y, current_epoch = next(train_loader)
 # Training config
 tokens_per_fwdbwd = args.device_batch_size * MAX_SEQ_LEN * ddp_world_size
 assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
-base_grad_accum = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
-
-# Batch size schedule: ramp from small -> medium -> large over 3 equal epoch stages.
-# Rationale: small batches give more gradient updates per token early (better exploration);
-# large batches are more compute-efficient later (faster wall-clock convergence).
-# LR schedule uses token-based warmdown (not step-based) to stay smooth across stage transitions.
-if args.batch_schedule and args.num_epochs >= 3:
-    _n = args.num_epochs
-    _e1 = _n // 3
-    _e2 = _n // 3
-    _ga_small = max(1, base_grad_accum // 2)
-    _ga_med   = base_grad_accum
-    _ga_large = base_grad_accum + base_grad_accum // 2
-    _batch_stages = [
-        (1,               _e1,          _ga_small),   # 0.5x batch
-        (_e1 + 1,         _e1 + _e2,    _ga_med),     # 1.0x batch
-        (_e1 + _e2 + 1,   _n,           _ga_large),   # 1.5x batch
-    ]
-    num_iterations = 0
-    for _s, _e, _ga in _batch_stages:
-        _n_ep = _e - _s + 1
-        num_iterations += round(TOKENS_PER_EPOCH * _n_ep / (_ga * tokens_per_fwdbwd))
-    # Total tokens for token-based LR schedule
-    _total_train_tokens = TOKENS_PER_EPOCH * args.num_epochs
-    _tokens_consumed = 0  # tracked during training
-    def get_batch_stage(epoch):
-        for s, e, ga in _batch_stages:
-            if s <= epoch <= e:
-                return ga, 1.0
-        return _batch_stages[-1][2], 1.0
-    print0(f"Batch schedule enabled (3 stages, token-based LR):")
-    for i, (s, e, ga) in enumerate(_batch_stages):
-        print0(f"  Stage {i+1}: epochs {s}-{e}, batch={ga * tokens_per_fwdbwd:,} tok, grad_accum={ga}")
-    print0(f"  Total tokens: {_total_train_tokens:,}, warmdown over last 50% of tokens")
-else:
-    num_iterations = round(TOKENS_PER_EPOCH * args.num_epochs / TOTAL_BATCH_SIZE)
-    _total_train_tokens = 0  # not used
-    _tokens_consumed = 0     # not used
-    def get_batch_stage(_epoch):
-        return base_grad_accum, 1.0
-
-grad_accum_steps = base_grad_accum  # initial value
-print0(f"Base batch size: {TOTAL_BATCH_SIZE:,} tokens, grad accum: {base_grad_accum} steps")
+grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
+num_iterations = round(TOKENS_PER_EPOCH * args.num_epochs / TOTAL_BATCH_SIZE)  # estimate for LR schedule
+print0(f"Batch size: {TOTAL_BATCH_SIZE:,} tokens, grad accum: {grad_accum_steps} steps")
 print0(f"Training for {args.num_epochs} epoch(s) (~{num_iterations} steps estimated)")
 print0(f"Eval set: {EVAL_TOKENS:,} tokens")
 
 # Schedulers
 def get_lr_multiplier(it):
-    """Step-based LR schedule (used when batch schedule is OFF)."""
     warmup = round(WARMUP_RATIO * num_iterations)
     warmdown = round(WARMDOWN_RATIO * num_iterations)
     if it < warmup: return (it + 1) / warmup
@@ -791,28 +778,8 @@ def get_lr_multiplier(it):
         progress = (num_iterations - it) / warmdown
         return progress + (1 - progress) * FINAL_LR_FRAC
 
-def get_lr_multiplier_tokens(tokens_consumed, total_tokens):
-    """Token-based LR schedule (used when batch schedule is ON).
-    Warmdown is computed over tokens, so it stays smooth across batch size changes."""
-    warmup_tokens = WARMUP_RATIO * total_tokens
-    warmdown_tokens = WARMDOWN_RATIO * total_tokens
-    warmdown_start = total_tokens - warmdown_tokens
-    if tokens_consumed < warmup_tokens:
-        return (tokens_consumed + 1) / warmup_tokens if warmup_tokens > 0 else 1.0
-    elif tokens_consumed <= warmdown_start:
-        return 1.0
-    else:
-        progress = (total_tokens - tokens_consumed) / warmdown_tokens
-        return max(0.0, progress + (1 - progress) * FINAL_LR_FRAC)
-
 def get_muon_momentum(it):
-    warmup = (1 - min(it / 300, 1)) * 0.85 + min(it / 300, 1) * 0.95
-    cooldown_steps = 50
-    cooldown_start = num_iterations - cooldown_steps
-    if it >= cooldown_start:
-        frac = (it - cooldown_start) / cooldown_steps
-        return 0.95 - frac * 0.10
-    return warmup
+    return (1 - min(it / 300, 1)) * 0.85 + min(it / 300, 1) * 0.95
 
 # Training loop
 step = 0
@@ -822,6 +789,8 @@ epochs_without_improvement = 0
 smooth_train_loss = 0
 total_training_time = 0
 eval_steps = EVAL_TOKENS // (args.device_batch_size * MAX_SEQ_LEN * ddp_world_size)
+
+wall_clock_start = time.time()
 
 # Initial val evaluation
 model.eval()
@@ -835,46 +804,25 @@ min_val_loss = val_loss
 model.train()
 
 while current_epoch <= args.num_epochs:
-    # Get batch schedule for current epoch
-    current_ga, current_lr_scale = get_batch_stage(current_epoch)
-    current_batch_size = current_ga * tokens_per_fwdbwd
-
     # Training step
     synchronize()
     t0 = time.time()
-    for micro_step in range(current_ga):
+    for micro_step in range(grad_accum_steps):
         with autocast_ctx:
             loss = model(x, y)
         train_loss = loss.detach()
-        (loss / current_ga).backward()
+        (loss / grad_accum_steps).backward()
         x, y, epoch = next(train_loader)
 
-    # NaN/Inf guard: skip optimizer step on bad gradients to prevent unrecoverable divergence
+    # Update optimizer
+    lrm = get_lr_multiplier(step)
+    for group in optimizer.param_groups:
+        group["lr"] = group["initial_lr"] * lrm
+        if group['kind'] == 'muon':
+            group["momentum"] = get_muon_momentum(step)
+    optimizer.step()
+    model.zero_grad(set_to_none=True)
     train_loss_f = train_loss.item()
-    _bad_step = not math.isfinite(train_loss_f)
-    if ddp:
-        _bad_flag = torch.tensor([1.0 if _bad_step else 0.0], device=device)
-        dist.all_reduce(_bad_flag, op=dist.ReduceOp.MAX)
-        _bad_step = _bad_flag.item() > 0
-
-    if _bad_step:
-        model.zero_grad(set_to_none=True)
-        print0(f"  [WARN] NaN/Inf loss detected at step {step+1}, skipping optimizer update")
-    else:
-        # Update optimizer
-        # Use token-based LR schedule when batch schedule is active (smooth across batch size changes),
-        # otherwise use the original step-based schedule.
-        if args.batch_schedule and _total_train_tokens > 0:
-            _tokens_consumed += current_batch_size
-            lrm = get_lr_multiplier_tokens(_tokens_consumed, _total_train_tokens) * current_lr_scale
-        else:
-            lrm = get_lr_multiplier(step) * current_lr_scale
-        for group in optimizer.param_groups:
-            group["lr"] = group["initial_lr"] * lrm
-            if group['kind'] == 'muon':
-                group["momentum"] = get_muon_momentum(step)
-        optimizer.step()
-        model.zero_grad(set_to_none=True)
     synchronize()
     dt = time.time() - t0
 
@@ -885,11 +833,11 @@ while current_epoch <= args.num_epochs:
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
     debiased = smooth_train_loss / (1 - ema_beta**step)
     pct = 100 * step / num_iterations
-    tok_per_sec = int(current_batch_size / dt)
-    mfu = 100 * num_flops_per_token * current_batch_size / dt / (gpu_peak_flops * ddp_world_size)
-    if step > 10:
+    tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
+    mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / (gpu_peak_flops * ddp_world_size)
+    if step > 3:
         total_training_time += dt
-    steps_done = step - 10
+    steps_done = step - 3
     eta_str = f" | eta: {(num_iterations - step) * total_training_time / steps_done / 60:.1f}m" if steps_done > 0 else ""
     print0(f"step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f} | dt: {dt*1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}%{eta_str}")
     wandb_run.log({"step": step, "train/loss": debiased, "train/mfu": mfu})
@@ -919,10 +867,6 @@ while current_epoch <= args.num_epochs:
                 print0(f"Early stopping: no improvement for {args.patience} epoch(s)")
                 break
         model.train()
-        # Update num_iterations estimate now that we know real steps per epoch
-        # steps_per_epoch = step // current_epoch
-        # num_iterations = steps_per_epoch * args.num_epochs
-        # print0(f"Epoch {current_epoch} took {steps_per_epoch} steps. Updated estimate: {num_iterations} total steps.")
         current_epoch = epoch
 
     # GC management
@@ -930,6 +874,8 @@ while current_epoch <= args.num_epochs:
         gc.collect(); gc.freeze(); gc.disable()
 
 # Summary
+wall_clock_time = time.time() - wall_clock_start
+print0(f"Wall clock time: {wall_clock_time/60:.2f}m")
 print0(f"Peak memory: {get_max_memory() / 1024 / 1024:.2f} MiB")
 print0(f"Total training time: {total_training_time/60:.2f}m")
 final_train_loss = smooth_train_loss / (1 - 0.9**step) if step > 0 else float('inf')
@@ -958,4 +904,4 @@ print0(f"Total wall time: {total_wall_time:.2f}s ({total_wall_time/60:.2f}m)")
 wandb_run.finish()
 if dist.is_initialized():
     dist.destroy_process_group()
-
+    

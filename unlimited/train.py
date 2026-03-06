@@ -35,7 +35,7 @@ import tiktoken
 
 parser = argparse.ArgumentParser(description="Train GPT ensemble")
 parser.add_argument("--device-batch-size", type=int, default=4)
-parser.add_argument("--num-epochs", type=int, default=12)
+parser.add_argument("--num-epochs", type=int, default=18)
 parser.add_argument("--patience", type=int, default=-1)
 parser.add_argument("--run", type=str, default=None)
 parser.add_argument("--scalar-lr", type=float, default=0.5)
@@ -177,6 +177,9 @@ class CausalSelfAttention(nn.Module):
         self.resid_dropout = nn.Dropout(config.dropout)
         self.ve_gate_channels = 32
         self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
+        # Attention gate: per-head gating to enable context-based no-op
+        self.attn_gate_channels = 12
+        self.attn_gate = nn.Linear(self.attn_gate_channels, self.n_head, bias=False)
 
     def forward(self, x, ve, cos_sin, window_size):
         B, T, C = x.size()
@@ -191,6 +194,8 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
         y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        # Attention gate: per-head sigmoid gate
+        y = y * torch.sigmoid(self.attn_gate(x[..., :self.attn_gate_channels])).unsqueeze(-1)
         y = y.contiguous().view(B, T, -1)
         return self.resid_dropout(self.c_proj(y))
 
@@ -198,12 +203,14 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+        hidden = 256 * ((8 * config.n_embd // 3 + 255) // 256)
+        self.c_gate = nn.Linear(config.n_embd, hidden, bias=False)
+        self.c_fc = nn.Linear(config.n_embd, hidden, bias=False)
+        self.c_proj = nn.Linear(hidden, config.n_embd, bias=False)
         self.resid_dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
-        return self.resid_dropout(self.c_proj(F.relu(self.c_fc(x)).square()))
+        return self.resid_dropout(self.c_proj(F.silu(self.c_gate(x)) * self.c_fc(x)))
 
 
 class Block(nn.Module):
@@ -235,7 +242,10 @@ class GPT(nn.Module):
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
-        self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab, kv_dim) for i in range(config.n_layer) if has_ve(i, config.n_layer)})
+        self.ve_projs = nn.ModuleDict({str(i): nn.Linear(config.n_embd, kv_dim, bias=False) for i in range(config.n_layer) if has_ve(i, config.n_layer)})
+        # U-Net skip connections: encoder layer i → decoder layer (n_layer - 1 - i)
+        self.encoder_layers = config.n_layer // 2
+        self.skip_weights = nn.Parameter(torch.ones(self.encoder_layers))
         self.rotary_seq_len = config.sequence_len * 10
         cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim)
         self.register_buffer("cos", cos, persistent=False)
@@ -251,22 +261,23 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight)
+            torch.nn.init.uniform_(block.mlp.c_gate.weight, -s, s)
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
         self.resid_lambdas.fill_(1.0)
         self.x0_lambdas.fill_(0.1)
-        for ve in self.value_embeds.values():
-            torch.nn.init.uniform_(ve.weight, -s, s)
+        for proj in self.ve_projs.values():
+            torch.nn.init.uniform_(proj.weight, -s, s)
         for block in self.transformer.h:
             if block.attn.ve_gate is not None:
                 torch.nn.init.zeros_(block.attn.ve_gate.weight)
+            torch.nn.init.zeros_(block.attn.attn_gate.weight)
+        self.skip_weights.fill_(1.0)
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim)
         self.cos, self.sin = cos, sin
         if self.transformer.wte.weight.device.type == "cuda":
             self.transformer.wte.to(dtype=torch.bfloat16)
-            for ve in self.value_embeds.values():
-                ve.to(dtype=torch.bfloat16)
 
     def _precompute_rotary(self, seq_len, head_dim, base=10000):
         device = self.transformer.wte.weight.device
@@ -289,12 +300,13 @@ class GPT(nn.Module):
 
     def setup_optimizer(self):
         ddp, rank, local_rank, world_size = get_dist_info()
-        matrix_params = list(self.transformer.h.parameters())
-        ve_params = list(self.value_embeds.parameters())
+        matrix_params = list(self.transformer.h.parameters()) + list(self.ve_projs.parameters())
+        ve_params = []
         embed_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
+        skip_params = [self.skip_weights]
 
         param_groups = [
             dict(kind='adamw', params=lm_head_params, lr=UNEMBEDDING_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=WEIGHT_DECAY),
@@ -302,6 +314,7 @@ class GPT(nn.Module):
             dict(kind='adamw', params=ve_params, lr=EMBEDDING_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=WEIGHT_DECAY),
             dict(kind='adamw', params=resid_params, lr=SCALAR_LR * 0.01, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=SCALAR_LR, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=skip_params, lr=SCALAR_LR * 0.01, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
         ]
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
@@ -318,10 +331,16 @@ class GPT(nn.Module):
         cos_sin = self.cos[:, :T], self.sin[:, :T]
         x = norm(self.transformer.wte(idx))
         x0 = x
+        skip_connections = []
         for i, block in enumerate(self.transformer.h):
+            if i >= self.encoder_layers and skip_connections:
+                skip = skip_connections.pop()
+                x = x + self.skip_weights[i - self.encoder_layers] * skip
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
+            ve = self.ve_projs[str(i)](x0) if str(i) in self.ve_projs else None
             x = block(x, ve, cos_sin, self.window_sizes[i])
+            if i < self.encoder_layers:
+                skip_connections.append(x)
         x = norm(x)
         logits = self.lm_head(x)[..., :self.config.vocab_size].float()
         logits = 15 * torch.tanh(logits / 15)
