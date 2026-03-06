@@ -1,4 +1,3 @@
-
 """
 Train a language model on ~100M tokens with val loss evaluation.
 Code is based on Nanochat (https://github.com/karpathy/nanochat), with modifications to support the slowrun setting.
@@ -57,7 +56,6 @@ parser.add_argument("--input_val_bin", type=str, default=None)
 parser.add_argument("--output_json", type=str, default=None)
 parser.add_argument("--wandb_group", type=str, default=None)
 parser.add_argument("--dropout", type=float, default=0.1)
-parser.add_argument("--split-embed-frac", type=float, default=0.67)
 args = parser.parse_args()
 
 # Resolve output path
@@ -210,6 +208,10 @@ class CausalSelfAttention(nn.Module):
         # Per-head attention gate: enables context-based attention no-op
         self.attn_gate_channels = 12
         self.attn_gate = nn.Linear(self.attn_gate_channels, self.n_head, bias=False)
+        # Determine if this is a long-window layer for partial key offset
+        pattern = config.window_pattern.upper()
+        char = pattern[layer_idx % len(pattern)]
+        self.use_key_offset = (char == 'L') or (layer_idx == config.n_layer - 1)
 
     def forward(self, x, ve, cos_sin, window_size):
         B, T, C = x.size()
@@ -224,6 +226,9 @@ class CausalSelfAttention(nn.Module):
         cos, sin = cos_sin
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
+        # Partial key offset: shift stationary dims forward by 1 on long-window layers
+        if self.use_key_offset and T > 1:
+            k[:, 1:, :, self.head_dim // 2:] = k[:, :-1, :, self.head_dim // 2:].clone()
         y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
         # Per-head attention gate (sparse gated attention, zero-init → sigmoid(0)=0.5 at start)
         y = y * torch.sigmoid(self.attn_gate(x[..., :self.attn_gate_channels])).unsqueeze(-1)
@@ -273,7 +278,7 @@ class GPT(nn.Module):
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
         self.ve_projs = nn.ModuleDict({str(i): nn.Linear(config.n_embd, kv_dim, bias=False) for i in range(config.n_layer) if has_ve(i, config.n_layer)})
-        # U-Net skip connections
+        # U-Net skip connections: encoder layer i → decoder layer (n_layer - 1 - i)
         self.encoder_layers = config.n_layer // 2
         self.skip_weights = nn.Parameter(torch.ones(self.encoder_layers))
         self.rotary_seq_len = config.sequence_len * 10
@@ -283,8 +288,8 @@ class GPT(nn.Module):
 
     @torch.no_grad()
     def init_weights(self):
+        torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
         torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
-        self.transformer.wte.weight.data.copy_(self.lm_head.weight.data)  # tie embeddings at init
         s = 3**0.5 * self.config.n_embd**-0.5
         for block in self.transformer.h:
             torch.nn.init.uniform_(block.attn.c_q.weight, -s, s)
@@ -295,7 +300,7 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
 
-        self.resid_lambdas.fill_(1.0)
+        self.resid_lambdas.fill_(1.1)
         self.x0_lambdas.fill_(0.1)
         for proj in self.ve_projs.values():
             torch.nn.init.uniform_(proj.weight, -s, s)  
@@ -312,7 +317,11 @@ class GPT(nn.Module):
 
     def _precompute_rotary(self, seq_len, head_dim, base=10000):
         device = self.transformer.wte.weight.device
-        inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, dtype=torch.float32, device=device) / head_dim))
+        # Half-truncated RoPE: only rotate half the dims, leave the rest stationary
+        half = head_dim // 4  # number of frequency pairs for the rotated half
+        inv_freq = 1.0 / (base ** (torch.arange(0, half * 2, 2, dtype=torch.float32, device=device) / (half * 2)))
+        # Pad with zeros for the stationary half
+        inv_freq = torch.cat([inv_freq, torch.zeros(head_dim // 2 - half, dtype=torch.float32, device=device)])
         t = torch.arange(seq_len, dtype=torch.float32, device=device)
         freqs = torch.outer(t, inv_freq)
         cos, sin = freqs.cos().bfloat16(), freqs.sin().bfloat16()
@@ -341,9 +350,9 @@ class GPT(nn.Module):
         ddp, rank, local_rank, world_size = get_dist_info()
         # Separate attn_gate params (small, Adam-optimized) from matrix params (Muon)
         attn_gate_params = [block.attn.attn_gate.weight for block in self.transformer.h]
-        exclude_ids = {id(p) for p in attn_gate_params}
+        attn_gate_ids = {id(p) for p in attn_gate_params}
         all_h_params = list(self.transformer.h.parameters()) + list(self.ve_projs.parameters())
-        matrix_params = [p for p in all_h_params if id(p) not in exclude_ids]
+        matrix_params = [p for p in all_h_params if id(p) not in attn_gate_ids]
         embed_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
@@ -376,9 +385,8 @@ class GPT(nn.Module):
         skip_connections = []
         for i, block in enumerate(self.transformer.h):
             if i >= self.encoder_layers and skip_connections:
-                skip_idx = i - self.encoder_layers
                 skip = skip_connections.pop()
-                x = x + self.skip_weights[skip_idx] * skip
+                x = x + self.skip_weights[i - self.encoder_layers] * skip
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.ve_projs[str(i)](x0) if str(i) in self.ve_projs else None
             x = block(x, ve, cos_sin, self.window_sizes[i])
@@ -768,8 +776,7 @@ assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
 grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
 num_iterations = round(TOKENS_PER_EPOCH * args.num_epochs / TOTAL_BATCH_SIZE)  # estimate for LR schedule
 print0(f"Batch size: {TOTAL_BATCH_SIZE:,} tokens, grad accum: {grad_accum_steps} steps")
-split_step = int(num_iterations * args.split_embed_frac)  # embed/lm_head tying split point
-print0(f"Training for {args.num_epochs} epoch(s) (~{num_iterations} steps estimated), embed untie at step {split_step}")
+print0(f"Training for {args.num_epochs} epoch(s) (~{num_iterations} steps estimated)")
 print0(f"Eval set: {EVAL_TOKENS:,} tokens")
 
 # Schedulers
@@ -818,12 +825,6 @@ while current_epoch <= args.num_epochs:
         (loss / grad_accum_steps).backward()
         x, y, epoch = next(train_loader)
 
-    # Embed/LM-head tying: zero wte gradients while tied (only lm_head trains)
-    if step < split_step:
-        wte_w = orig_model.transformer.wte.weight
-        if wte_w.grad is not None:
-            wte_w.grad.zero_()
-
     # Update optimizer
     lrm = get_lr_multiplier(step)
     for group in optimizer.param_groups:
@@ -832,13 +833,6 @@ while current_epoch <= args.num_epochs:
             group["momentum"] = get_muon_momentum(step)
     optimizer.step()
     model.zero_grad(set_to_none=True)
-
-    # Embed/LM-head tying: sync wte from lm_head while tied
-    if step < split_step:
-        orig_model.transformer.wte.weight.data.copy_(
-            orig_model.lm_head.weight.data.to(orig_model.transformer.wte.weight.dtype)
-        )
-
     train_loss_f = train_loss.item()
     synchronize()
     dt = time.time() - t0
