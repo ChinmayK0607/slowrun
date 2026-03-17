@@ -181,7 +181,7 @@ class CausalSelfAttention(nn.Module):
         self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.resid_dropout = nn.Dropout(config.dropout)
-        self.ve_gate_channels = 32
+        self.ve_gate_channels = 16
         self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
         # Attention gate: per-head gating to enable context-based no-op
         self.attn_gate_channels = 12
