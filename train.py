@@ -37,8 +37,8 @@ parser.add_argument("--device-batch-size", type=int, default=4)
 parser.add_argument("--num-epochs", type=int, default=12)
 parser.add_argument("--patience", type=int, default=-1)
 parser.add_argument("--run", type=str, default=None)
-parser.add_argument("--scalar-lr", type=float, default=0.5)
-parser.add_argument("--matrix-lr", type=float, default=0.08)
+parser.add_argument("--scalar-lr", type=float, default=0.1)
+parser.add_argument("--matrix-lr", type=float, default=0.04)
 parser.add_argument("--weight-decay", type=float, default=1.6)
 parser.add_argument("--total-batch-size", type=int, default=524288)
 parser.add_argument("--save-result", type=str, default="")
@@ -51,6 +51,12 @@ parser.add_argument("--input_val_bin", type=str, default=None)
 parser.add_argument("--output_json", type=str, default=None)
 parser.add_argument("--wandb_group", type=str, default=None)
 parser.add_argument("--dropout", type=float, default=0.1)
+parser.add_argument("--dupe-start-epoch", type=int, default=10,
+                    help="Epoch to enable layer duplication")
+parser.add_argument("--dupe-layers-start", type=int, default=15,
+                    help="First decoder layer to duplicate (inclusive)")
+parser.add_argument("--dupe-layers-end", type=int, default=21,
+                    help="Last decoder layer to duplicate (exclusive)")
 args = parser.parse_args()
 
 # Resolve output path
@@ -75,8 +81,8 @@ DATA_DIR = "fineweb_data"
 # Base optimizer hyperparameters
 BASE_MATRIX_LR = args.matrix_lr
 BASE_SCALAR_LR = args.scalar_lr
-BASE_EMBEDDING_LR = 0.3
-BASE_UNEMBEDDING_LR = 0.004
+BASE_EMBEDDING_LR = 0.15
+BASE_UNEMBEDDING_LR = 0.002
 
 # Apply LR multiplier if provided (scales all LRs uniformly)
 _lr_mult = args.lr_multiplier if args.lr_multiplier is not None else 1.0
@@ -88,7 +94,7 @@ SCALAR_LR = BASE_SCALAR_LR * _lr_mult
 WEIGHT_DECAY = args.weight_decay
 ADAM_BETAS = (0.8, 0.95)
 WARMUP_RATIO = 0.0
-WARMDOWN_RATIO = 0.5
+WARMDOWN_RATIO = 0.2
 FINAL_LR_FRAC = 0.0
 
 # =============================================================================
@@ -195,6 +201,11 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
         y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        # XSA: remove self-value projection from attention output (arXiv 2603.09078)
+        vn = F.normalize(v, dim=-1)
+        if self.n_kv_head != self.n_head:
+            vn = vn.repeat_interleave(self.n_head // self.n_kv_head, dim=2)
+        y = y - (y * vn).sum(dim=-1, keepdim=True) * vn
         # Attention gate: per-head sigmoid gate
         y = y * torch.sigmoid(self.attn_gate(x[..., :self.attn_gate_channels])).unsqueeze(-1)
         y = y.contiguous().view(B, T, -1)
@@ -249,6 +260,13 @@ class GPT(nn.Module):
         cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim)
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
+        self._dupe_layers = None  # (start, end) or None
+
+    def set_dupe_layers(self, start, end):
+        assert start >= self.encoder_layers, "dupe layers must be decoder-only"
+        assert end <= self.config.n_layer
+        self._dupe_layers = (start, end)
+        print0(f"Dupe layers {start}-{end-1}: decoder layers repeated with skip connections")
 
     @torch.no_grad()
     def init_weights(self):
@@ -333,26 +351,57 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
+    def _run_decoder_layers(self, x, x0, cos_sin, encoder_outputs, start, end):
+        """Run decoder layers [start, end), with U-Net skip connections."""
+        for i in range(start, end):
+            # Encoder layer j connects to decoder layer (n_layer - 1 - j)
+            j = self.config.n_layer - 1 - i
+            if 0 <= j < self.encoder_layers:
+                x = x + self.skip_weights[i - self.encoder_layers] * encoder_outputs[j]
+            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+            ve = self.ve_projs[str(i)](x0) if str(i) in self.ve_projs else None
+            x = self.transformer.h[i](x, ve, cos_sin, self.window_sizes[i])
+        return x
+
     def forward(self, idx, targets=None, loss_reduction='mean'):
         B, T = idx.size()
         cos_sin = self.cos[:, :T], self.sin[:, :T]
         x = norm(self.transformer.wte(idx))
         x0 = x
-        skip_connections = []
-        for i, block in enumerate(self.transformer.h):
-            if i >= self.encoder_layers and skip_connections:
-                skip = skip_connections.pop()
-                x = x + self.skip_weights[i - self.encoder_layers] * skip
+
+        # Encoder half: run layers and collect outputs for skip connections
+        encoder_outputs = []
+        for i in range(self.encoder_layers):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.ve_projs[str(i)](x0) if str(i) in self.ve_projs else None
-            x = block(x, ve, cos_sin, self.window_sizes[i])
-            if i < self.encoder_layers:
-                skip_connections.append(x)
+            x = self.transformer.h[i](x, ve, cos_sin, self.window_sizes[i])
+            encoder_outputs.append(x)
+
+        # Decoder half
+        dupe = self._dupe_layers
+        if dupe is None:
+            x = self._run_decoder_layers(x, x0, cos_sin, encoder_outputs,
+                                        self.encoder_layers, self.config.n_layer)
+        else:
+            # First pass: encoder boundary through end of dupe range
+            x = self._run_decoder_layers(x, x0, cos_sin, encoder_outputs,
+                                        self.encoder_layers, dupe[1])
+            # Replay 1: run dupe range again
+            x = self._run_decoder_layers(x, x0, cos_sin, encoder_outputs,
+                                        dupe[0], dupe[1])
+            # Replay 2: run dupe range a third time
+            x = self._run_decoder_layers(x, x0, cos_sin, encoder_outputs,
+                                        dupe[0], dupe[1])
+            # Remaining decoder layers
+            x = self._run_decoder_layers(x, x0, cos_sin, encoder_outputs,
+                                        dupe[1], self.config.n_layer)
+
         x = norm(x)
         logits = self.lm_head(x)[..., :self.config.vocab_size].float()
-        logits = 15 * torch.tanh(logits / 15)  # softcap
+        logits = 15 * torch.tanh(logits / 15)
         if targets is not None:
-            return F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            return F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1),
+                                ignore_index=-1, reduction=loss_reduction)
         return logits
 
 # =============================================================================
@@ -754,7 +803,10 @@ min_val_loss = float("inf")
 epochs_without_improvement = 0
 smooth_train_loss = 0
 total_training_time = 0
+timed_steps = 0
+timing_start_step = 4  # skip first compile + 3 warmup steps
 eval_steps = EVAL_TOKENS // (args.device_batch_size * MAX_SEQ_LEN * ddp_world_size)
+dupe_active = False
 
 # Initial val evaluation
 model.eval()
@@ -768,6 +820,15 @@ min_val_loss = val_loss
 model.train()
 
 while current_epoch <= args.num_epochs:
+    if not dupe_active and current_epoch >= args.dupe_start_epoch:
+        print0(f"\n=== Enabling dupe-layers at epoch {current_epoch} ===")
+        orig_model.set_dupe_layers(args.dupe_layers_start, args.dupe_layers_end)
+        model = torch.compile(orig_model, dynamic=False) 
+        # model = orig_model # replace compile with this line for eager mode
+        dupe_active = True
+        timing_start_step = step + 4  # skip dupe recompile + 3 warmup steps
+        gc.enable(); gc.collect()
+
     # Training step
     synchronize()
     t0 = time.time()
@@ -799,11 +860,12 @@ while current_epoch <= args.num_epochs:
     pct = 100 * step / num_iterations
     tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
     mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / (gpu_peak_flops * ddp_world_size)
-    if step > 10:
+    if step >= timing_start_step:
         total_training_time += dt
-    steps_done = step - 10
-    eta_str = f" | eta: {(num_iterations - step) * total_training_time / steps_done / 60:.1f}m" if steps_done > 0 else ""
-    print0(f"step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f} | dt: {dt*1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}%{eta_str}")
+        timed_steps += 1
+    eta_str = f" | eta: {(num_iterations - step) * total_training_time / timed_steps / 60:.1f}m" if timed_steps > 0 else ""
+    dupe_str = " [DUPE]" if dupe_active else ""
+    print0(f"step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f} | dt: {dt*1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}%{dupe_str}{eta_str}")
     wandb_run.log({"step": step, "train/loss": debiased, "train/mfu": mfu})
 
     # Synchronize epoch across ranks (different ranks may exhaust data at different steps)
@@ -870,4 +932,3 @@ print0(f"Total wall time: {total_wall_time:.2f}s ({total_wall_time/60:.2f}m)")
 wandb_run.finish()
 if dist.is_initialized():
     dist.destroy_process_group()
-

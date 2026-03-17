@@ -1,12 +1,24 @@
 """
 Train an ensemble of language models and evaluate running ensemble val loss.
 
-Trains N models (default 8) with different random seeds, shuffling data each epoch.
+Trains N models (default 10) with different random seeds, shuffling data each epoch.
 After each model is trained, computes ensemble val loss by averaging logits across
-all models trained so far.
+all models trained so far. 
+The reported ensemble metric excludes model 0, which is weaker (no distillation 
+teacher, fewer epochs) and hurts ensemble quality.
 
 Usage:
     torchrun --standalone --nproc_per_node=8 unlimited/train.py
+
+Usage (two nodes):
+    On each node, run:
+
+    torchrun --nnodes=2 --nproc_per_node=8 --node_rank={0 or 1} \
+        --master_addr=<node0_ip> --master_port=29500 \
+        unlimited/train.py [OPTIONS]
+
+    Training data and checkpoint paths must be on a
+    shared filesystem visible to both nodes.
 """
 
 import os
@@ -35,7 +47,8 @@ import tiktoken
 
 parser = argparse.ArgumentParser(description="Train GPT ensemble")
 parser.add_argument("--device-batch-size", type=int, default=4)
-parser.add_argument("--num-epochs", type=int, default=18)
+parser.add_argument("--num-epochs-model-0", type=int, default=18, help="Epochs for first model (defaults to --num-epochs)")
+parser.add_argument("--num-epochs", type=int, default=24, help="Total epochs for models that are not model 0")
 parser.add_argument("--patience", type=int, default=-1)
 parser.add_argument("--run", type=str, default=None)
 parser.add_argument("--scalar-lr", type=float, default=0.5)
@@ -52,9 +65,16 @@ parser.add_argument("--input_val_bin", type=str, default=None)
 parser.add_argument("--output_json", type=str, default=None)
 parser.add_argument("--wandb_group", type=str, default=None)
 parser.add_argument("--dropout", type=float, default=0.1)
-parser.add_argument("--num-models", type=int, default=8, help="Number of ensemble members")
+parser.add_argument("--num-models", type=int, default=10, help="Number of ensemble members")
 parser.add_argument("--checkpoint-base", type=str, default="checkpoints", help="Base directory for checkpoints")
 parser.add_argument("--resume", type=str, default=None, help="Run ID to resume from (e.g. 20250226_143000)")
+parser.add_argument("--distill-alpha", type=float, default=0.7, help="Weight for distillation loss (0=hard labels only, 1=soft labels only)")
+parser.add_argument("--distill-temperature", type=float, default=1.0, help="Temperature for softening teacher logits")
+parser.add_argument("--dupe-layers-start", type=int, default=15,
+                    help="First decoder layer to duplicate (inclusive)")
+parser.add_argument("--dupe-layers-end", type=int, default=21,
+                    help="Last decoder layer to duplicate (exclusive)")
+parser.add_argument("--dupe-fraction", type=float, default=0.75, help="Dupe layers activate for the last (1 - this) fraction of epochs")
 args = parser.parse_args()
 
 if args.output_json and not args.save_result:
@@ -250,6 +270,13 @@ class GPT(nn.Module):
         cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim)
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
+        self._dupe_layers = None  # (start, end) or None
+
+    def set_dupe_layers(self, start, end):
+        assert start >= self.encoder_layers, "dupe layers must be decoder-only"
+        assert end <= self.config.n_layer
+        self._dupe_layers = (start, end)
+        print0(f"Dupe layers {start}-{end-1}: decoder layers repeated with skip connections")
 
     @torch.no_grad()
     def init_weights(self):
@@ -278,6 +305,7 @@ class GPT(nn.Module):
         self.cos, self.sin = cos, sin
         if self.transformer.wte.weight.device.type == "cuda":
             self.transformer.wte.to(dtype=torch.bfloat16)
+        self._dupe_layers = None
 
     def _precompute_rotary(self, seq_len, head_dim, base=10000):
         device = self.transformer.wte.weight.device
@@ -326,21 +354,54 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
+    def _run_decoder_layers(self, x, x0, cos_sin, encoder_outputs, start, end):
+        """Run decoder layers [start, end), with U-Net skip connections."""
+        for i in range(start, end):
+            # Encoder layer j connects to decoder layer (n_layer - 1 - j)
+            j = self.config.n_layer - 1 - i
+            if 0 <= j < self.encoder_layers:
+                x = x + self.skip_weights[i - self.encoder_layers] * encoder_outputs[j]
+            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+            ve = self.ve_projs[str(i)](x0) if str(i) in self.ve_projs else None
+            x = self.transformer.h[i](x, ve, cos_sin, self.window_sizes[i])
+        return x
+
     def forward(self, idx, targets=None, loss_reduction='mean'):
         B, T = idx.size()
         cos_sin = self.cos[:, :T], self.sin[:, :T]
         x = norm(self.transformer.wte(idx))
         x0 = x
-        skip_connections = []
-        for i, block in enumerate(self.transformer.h):
-            if i >= self.encoder_layers and skip_connections:
-                skip = skip_connections.pop()
-                x = x + self.skip_weights[i - self.encoder_layers] * skip
+
+        # Encoder half: run layers and collect outputs for skip connections
+        encoder_outputs = []
+        for i in range(self.encoder_layers):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.ve_projs[str(i)](x0) if str(i) in self.ve_projs else None
-            x = block(x, ve, cos_sin, self.window_sizes[i])
-            if i < self.encoder_layers:
-                skip_connections.append(x)
+            x = self.transformer.h[i](x, ve, cos_sin, self.window_sizes[i])
+            encoder_outputs.append(x)
+
+        # Decoder half
+        dupe = self._dupe_layers
+        if dupe is None:
+            x = self._run_decoder_layers(x, x0, cos_sin, encoder_outputs,
+                                        self.encoder_layers, self.config.n_layer)
+        else:
+            # First pass: encoder boundary through end of dupe range
+            x = self._run_decoder_layers(x, x0, cos_sin, encoder_outputs,
+                                        self.encoder_layers, dupe[1])
+            # Replay 1
+            x = self._run_decoder_layers(x, x0, cos_sin, encoder_outputs,
+                                        dupe[0], dupe[1])
+            # Replay 2
+            x = self._run_decoder_layers(x, x0, cos_sin, encoder_outputs,
+                                        dupe[0], dupe[1])
+            # Replay 3
+            x = self._run_decoder_layers(x, x0, cos_sin, encoder_outputs,
+                                        dupe[0], dupe[1])
+            # Remaining decoder layers
+            x = self._run_decoder_layers(x, x0, cos_sin, encoder_outputs,
+                                        dupe[1], self.config.n_layer)
+
         x = norm(x)
         logits = self.lm_head(x)[..., :self.config.vocab_size].float()
         logits = 15 * torch.tanh(logits / 15)
@@ -645,6 +706,7 @@ def evaluate_ensemble_bpb(checkpoint_paths, config, token_bytes, device, autocas
         model.init_weights()  # initializes rotary buffers (non-persistent, not in state_dict)
         state_dict = torch.load(ckpt_path, map_location=device, weights_only=True)
         model.load_state_dict(state_dict)
+        model.set_dupe_layers(args.dupe_layers_start, args.dupe_layers_end)
         model.eval()
         ensemble_models.append(model)
         del state_dict
@@ -713,12 +775,87 @@ def evaluate_ensemble_bpb(checkpoint_paths, config, token_bytes, device, autocas
 
 
 # =============================================================================
+# Teacher loading for distillation
+# =============================================================================
+
+def load_teacher_models(checkpoint_paths, config, device):
+    """Load previously trained models as frozen teachers for distillation."""
+    teachers = []
+    for ckpt_path in checkpoint_paths:
+        with torch.device("meta"):
+            m = GPT(config)
+        m.to_empty(device=device)
+        m.init_weights()
+        sd = torch.load(ckpt_path, map_location=device, weights_only=True)
+        m.load_state_dict(sd)
+        m.set_dupe_layers(args.dupe_layers_start, args.dupe_layers_end)
+        m.eval()
+        teachers.append(m)
+        del sd
+    return teachers
+
+
+# =============================================================================
 # Training one model
 # =============================================================================
 
+@torch.no_grad()
+def evaluate_distill_val(student, teacher, batches, steps, autocast_ctx, alpha, temperature, device):
+    """Compute val KL loss, combined loss, and teacher CE loss."""
+    total_student_ce = torch.tensor(0.0, dtype=torch.float64, device=device)
+    total_kl        = torch.tensor(0.0, dtype=torch.float64, device=device)
+    total_teacher_ce = torch.tensor(0.0, dtype=torch.float64, device=device)
+    total_tokens    = torch.tensor(0, dtype=torch.int64, device=device)
+
+    batch_iter = iter(batches)
+    for _ in range(steps):
+        x, y, _ = next(batch_iter)
+        with autocast_ctx:
+            student_logits = student.forward_logits(x).float()
+            teacher_logits = teacher.forward_logits(x).float()
+
+        flat_s = student_logits.view(-1, student_logits.size(-1))
+        flat_t = teacher_logits.view(-1, teacher_logits.size(-1))
+        flat_y = y.view(-1)
+        mask = flat_y != -1
+
+        student_ce_sum  = F.cross_entropy(flat_s, flat_y, ignore_index=-1, reduction='sum')
+        teacher_ce_sum  = F.cross_entropy(flat_t, flat_y, ignore_index=-1, reduction='sum')
+        T = temperature
+        kl_sum = F.kl_div(
+            F.log_softmax(flat_s[mask] / T, dim=-1),
+            F.softmax(flat_t[mask] / T, dim=-1),
+            reduction='sum',
+        ) * (T * T)
+
+        total_student_ce  += student_ce_sum.double()
+        total_kl          += kl_sum.double()
+        total_teacher_ce  += teacher_ce_sum.double()
+        total_tokens      += mask.sum()
+
+    if dist.is_initialized():
+        for t in [total_student_ce, total_kl, total_teacher_ce, total_tokens]:
+            dist.all_reduce(t, op=dist.ReduceOp.SUM)
+
+    n = total_tokens.item()
+    if n == 0:
+        return float('inf'), float('inf'), float('inf')
+
+    val_kl         = total_kl.item() / n
+    val_teacher_ce = total_teacher_ce.item() / n
+    val_combined   = (1 - alpha) * (total_student_ce.item() / n) + alpha * val_kl
+    return val_kl, val_combined, val_teacher_ce
+    
 def train_single_model(model_idx, seed, device, config, autocast_ctx, token_bytes,
-                       wandb_run, ddp, ddp_world_size, checkpoint_dir):
-    """Train a single model with the given seed. Returns path to saved checkpoint."""
+                       wandb_run, ddp, ddp_world_size, checkpoint_dir,
+                       teacher_checkpoint_paths=None, num_epochs=None):
+    """Train a single model with the given seed. Returns path to saved checkpoint.
+
+    If teacher_checkpoint_paths is non-empty, trains with knowledge distillation:
+    each model learns from both the hard labels and the soft logits of the
+    immediately preceding model (chain distillation). Only one teacher is loaded
+    at a time, keeping memory usage constant regardless of ensemble size.
+    """
     print0(f"\n{'='*60}")
     print0(f"Training model {model_idx + 1} with seed {seed}")
     print0(f"{'='*60}")
@@ -732,6 +869,9 @@ def train_single_model(model_idx, seed, device, config, autocast_ctx, token_byte
         model = GPT(config)
     model.to_empty(device=device)
     model.init_weights()
+
+    # Keep reference to uncompiled model for dupe layer activation
+    orig_model = model
 
     # Compile
     compiled_model = torch.compile(model, dynamic=False)
@@ -748,10 +888,16 @@ def train_single_model(model_idx, seed, device, config, autocast_ctx, token_byte
     tokens_per_fwdbwd = args.device_batch_size * MAX_SEQ_LEN * ddp_world_size
     assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
     grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
+    print0(f"  [model {model_idx+1}] Grad accum steps: {grad_accum_steps}")
     TOKENS_PER_EPOCH = train_loader.total_tokens
-    num_iterations = round(TOKENS_PER_EPOCH * args.num_epochs / TOTAL_BATCH_SIZE)
+    num_iterations = round(TOKENS_PER_EPOCH * num_epochs / TOTAL_BATCH_SIZE)
 
     synchronize = torch.cuda.synchronize if device.type == "cuda" else lambda: None
+
+    # Dupe layers: activate for the last 25% of epochs
+    dupe_start_epoch = math.ceil(args.dupe_fraction * num_epochs) + 1  # epoch number (1-indexed) to activate
+    dupe_active = False
+    print0(f"  [model {model_idx+1}] Dupe layers will activate at epoch {dupe_start_epoch} (of {num_epochs})")
 
     # LR schedule
     def get_lr_multiplier(it):
@@ -772,20 +918,69 @@ def train_single_model(model_idx, seed, device, config, autocast_ctx, token_byte
     min_val_loss = float("inf")
     epochs_without_improvement = 0
     smooth_train_loss = 0
+    smooth_train_hard_loss = 0  # EMA for hard CE component
+    smooth_train_kl_loss = 0    # EMA for KL distillation component
     total_training_time = 0
     eval_steps = EVAL_TOKENS // (args.device_batch_size * MAX_SEQ_LEN * ddp_world_size)
+
+    # Load teacher models for distillation (empty list = no distillation)
+    teacher_models = []
+    if teacher_checkpoint_paths:
+        print0(f"  [model {model_idx+1}] Loading {len(teacher_checkpoint_paths)} teacher model(s) for distillation...")
+        teacher_models = load_teacher_models(teacher_checkpoint_paths, config, device)
+        print0(f"  [model {model_idx+1}] Teachers loaded.")
 
     # Enable GC for fresh model
     gc.enable()
     gc.collect()
 
     compiled_model.train()
-    while current_epoch <= args.num_epochs:
+    while current_epoch <= num_epochs:
+        # Activate dupe layers for the last 25% of training
+        if not dupe_active and current_epoch >= dupe_start_epoch:
+            print0(f"\n  [model {model_idx+1}] === Enabling dupe-layers at epoch {current_epoch} ===")
+            orig_model.set_dupe_layers(args.dupe_layers_start, args.dupe_layers_end)
+            compiled_model = torch.compile(orig_model, dynamic=False)
+            dupe_active = True
+            gc.enable(); gc.collect()
+
         synchronize()
         t0 = time.time()
+        train_hard_loss = None
+        train_kl_loss = None
         for micro_step in range(grad_accum_steps):
-            with autocast_ctx:
-                loss = compiled_model(x, y)
+            if teacher_models:
+                # --- Chain distillation loss ---
+                with torch.inference_mode():
+                    with autocast_ctx:
+                        teacher_logits = teacher_models[0].forward_logits(x).float()
+
+                with autocast_ctx:
+                    student_logits = compiled_model(x)
+
+                flat_s = student_logits.view(-1, student_logits.size(-1))
+                flat_t = teacher_logits.view(-1, teacher_logits.size(-1))
+                flat_y = y.view(-1)
+                mask = flat_y != -1
+
+                hard_loss = F.cross_entropy(flat_s, flat_y, ignore_index=-1)
+
+                T = args.distill_temperature
+                kl_loss = F.kl_div(
+                    F.log_softmax(flat_s[mask] / T, dim=-1),
+                    F.softmax(flat_t[mask] / T, dim=-1),
+                    reduction='batchmean',
+                ) * (T * T)
+
+                loss = (1 - args.distill_alpha) * hard_loss + args.distill_alpha * kl_loss
+                train_hard_loss = hard_loss.detach()
+                train_kl_loss = kl_loss.detach()
+                del teacher_logits
+            else:
+                # --- Standard cross-entropy loss ---
+                with autocast_ctx:
+                    loss = compiled_model(x, y)
+
             train_loss = loss.detach()
             (loss / grad_accum_steps).backward()
             x, y, epoch = next(train_loader)
@@ -800,6 +995,7 @@ def train_single_model(model_idx, seed, device, config, autocast_ctx, token_byte
         train_loss_f = train_loss.item()
         synchronize()
         dt = time.time() - t0
+        toks_per_sec = TOTAL_BATCH_SIZE / dt
 
         step += 1
 
@@ -810,13 +1006,27 @@ def train_single_model(model_idx, seed, device, config, autocast_ctx, token_byte
         pct = 100 * step / num_iterations
         if step > 10:
             total_training_time += dt
+        dupe_str = " [DUPE]" if dupe_active else ""
         if step % 50 == 0 or step == 1:
-            print0(f"  [model {model_idx+1}] step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f}")
-        wandb_run.log({
+            print0(f"  [model {model_idx+1}] step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f} | {toks_per_sec:.0f} tok/s{dupe_str}")
+
+        log_dict = {
             "step": step,
             f"model_{model_idx+1}/train_loss": debiased,
             "model_idx": model_idx,
-        })
+            "tokens_per_sec": toks_per_sec,
+        }
+
+        # Log decomposed distillation train losses when teacher is present
+        if train_hard_loss is not None:
+            smooth_train_hard_loss = ema_beta * smooth_train_hard_loss + (1 - ema_beta) * train_hard_loss.item()
+            smooth_train_kl_loss   = ema_beta * smooth_train_kl_loss   + (1 - ema_beta) * train_kl_loss.item()
+            debiased_hard = smooth_train_hard_loss / (1 - ema_beta**step)
+            debiased_kl   = smooth_train_kl_loss   / (1 - ema_beta**step)
+            log_dict[f"model_{model_idx+1}/train_hard_loss"] = debiased_hard
+            log_dict[f"model_{model_idx+1}/train_kl_loss"]   = debiased_kl
+
+        wandb_run.log(log_dict)
 
         # Epoch sync
         if ddp:
@@ -828,15 +1038,41 @@ def train_single_model(model_idx, seed, device, config, autocast_ctx, token_byte
         if epoch != current_epoch:
             compiled_model.eval()
             _val_path = args.input_val_bin if args.input_val_bin else os.path.join(DATA_DIR, "fineweb_val.pt")
+
+            # Standard CE val metrics
             val_loader = DataLoader(_val_path, args.device_batch_size, MAX_SEQ_LEN, device=device, seed=0)
             with autocast_ctx:
                 val_bpb, val_loss = evaluate_bpb(compiled_model, val_loader, eval_steps, token_bytes)
             print0(f"  [model {model_idx+1}] Epoch {current_epoch} | Val BPB: {val_bpb:.6f} | Val Loss: {val_loss:.6f}")
-            wandb_run.log({
+
+            log_dict = {
                 "step": step,
                 f"model_{model_idx+1}/val_bpb": val_bpb,
                 f"model_{model_idx+1}/val_loss": val_loss,
-            })
+            }
+
+            # Distillation val metrics (only when a teacher is present)
+            if teacher_models:
+                val_loader2 = DataLoader(_val_path, args.device_batch_size, MAX_SEQ_LEN, device=device, seed=0)
+                val_kl, val_combined, teacher_val_ce = evaluate_distill_val(
+                    student=compiled_model,
+                    teacher=teacher_models[0],
+                    batches=val_loader2,
+                    steps=eval_steps,
+                    autocast_ctx=autocast_ctx,
+                    alpha=args.distill_alpha,
+                    temperature=args.distill_temperature,
+                    device=device,
+                )
+                print0(f"  [model {model_idx+1}] Epoch {current_epoch} | Val KL: {val_kl:.6f} | Val Combined: {val_combined:.6f} | Teacher Val CE: {teacher_val_ce:.6f}")
+                log_dict.update({
+                    f"model_{model_idx+1}/val_kl": val_kl,
+                    f"model_{model_idx+1}/val_combined": val_combined,
+                    f"model_{model_idx+1}/teacher_val_ce": teacher_val_ce,
+                })
+
+            wandb_run.log(log_dict)
+
             if val_bpb < min_val_bpb:
                 min_val_bpb = val_bpb
                 min_val_loss = val_loss
@@ -852,10 +1088,17 @@ def train_single_model(model_idx, seed, device, config, autocast_ctx, token_byte
         if step == 1:
             gc.collect(); gc.freeze(); gc.disable()
 
+    # Free teacher models before saving (they're no longer needed)
+    if teacher_models:
+        del teacher_models
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
     # Save checkpoint (uncompiled model state_dict)
     checkpoint_path = os.path.join(checkpoint_dir, f"model_{model_idx}.pt")
     if int(os.environ.get('RANK', 0)) == 0:
-        torch.save(model.state_dict(), checkpoint_path)
+        torch.save(orig_model.state_dict(), checkpoint_path)
     if ddp:
         dist.barrier()
 
@@ -863,7 +1106,7 @@ def train_single_model(model_idx, seed, device, config, autocast_ctx, token_byte
     print0(f"  Checkpoint saved to {checkpoint_path}")
 
     # Cleanup
-    del model, compiled_model, optimizer, train_loader
+    del model, orig_model, compiled_model, optimizer, train_loader
     gc.enable()
     gc.collect()
     if device.type == "cuda":
@@ -939,6 +1182,8 @@ def main():
     print0(f"  run_id={run_id}  (resume with: --resume {run_id})")
     print0(f"  n_layer={DEPTH}, n_embd={N_EMBD}, n_head={N_HEAD}")
     print0(f"  num_epochs={args.num_epochs}, dropout={args.dropout}")
+    print0(f"  num_epochs_model_0={args.num_epochs_model_0}")
+    print0(f"  dupe_layers={args.dupe_layers_start}-{args.dupe_layers_end} (last {100*(1-args.dupe_fraction):.0f}% of epochs)")
     print0(f"  checkpoint_dir={checkpoint_dir}")
     print0(f"{'='*60}")
 
@@ -979,7 +1224,10 @@ def main():
                 json.dump(progress, f, indent=2)
 
     for model_idx in range(resume_from, args.num_models):
-        # Train one model
+        # Chain distillation: only the immediately preceding model is the teacher
+        last_ckpt = [checkpoint_paths[-1]] if checkpoint_paths else []
+        _num_epochs = (args.num_epochs_model_0 or args.num_epochs) if model_idx == 0 else args.num_epochs
+        print0(f"Training model {model_idx + 1} with {_num_epochs} epochs")
         ckpt_path, best_bpb, best_loss = train_single_model(
             model_idx=model_idx,
             seed=seeds[model_idx],
@@ -991,6 +1239,8 @@ def main():
             ddp=ddp,
             ddp_world_size=ddp_world_size,
             checkpoint_dir=checkpoint_dir,
+            num_epochs=_num_epochs,
+            teacher_checkpoint_paths=last_ckpt,
         )
         checkpoint_paths.append(ckpt_path)
         individual_results.append({"model": model_idx + 1, "seed": seeds[model_idx],
@@ -1016,6 +1266,23 @@ def main():
             "ensemble/val_loss": ens_loss,
         })
         save_progress()
+        # Ensemble excluding model 0 — this is the reported ensemble metric,
+        # since model 0 (no distillation teacher, fewer epochs) hurts ensemble quality.
+        if len(checkpoint_paths) >= 2:
+            ens_nf_bpb, ens_nf_loss = evaluate_ensemble_bpb(
+                checkpoint_paths=checkpoint_paths[1:],
+                config=config,
+                token_bytes=token_bytes,
+                device=device,
+                autocast_ctx=autocast_ctx,
+            )
+            num_no_first = len(checkpoint_paths) - 1
+            print0(f"Ensemble excl. model 0 ({num_no_first} models) | Val BPB: {ens_nf_bpb:.6f} | Val Loss: {ens_nf_loss:.6f}")
+            wandb_run.log({
+                "ensemble_no_first/num_models": num_no_first,
+                "ensemble_no_first/val_bpb": ens_nf_bpb,
+                "ensemble_no_first/val_loss": ens_nf_loss,
+            })
 
     # Final summary
     print0(f"\n{'='*60}")
