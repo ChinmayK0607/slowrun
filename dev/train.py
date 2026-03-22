@@ -4,6 +4,13 @@ Code is based on Nanochat (https://github.com/karpathy/nanochat), with modificat
 
 Usage:
    torchrun --standalone --nproc_per_node=8 train.py --gdn-layers "1,3,5,7,9,11,13,16,18,20,22,24,26,28"
+   Performance reference (8×H100, 12 epochs, alternating-14 layout):
+      Config: --gdn-layers 1,3,5,6,8,10,11,13,15,16,18,20,22,23 (14 GDN / 16 softmax)
+      Val loss: 3.2458 (baseline 3.2526, Δ = −0.0068)
+      Val BPB:  1.0548 (baseline 1.0570)
+      Training time: 80.78 min (baseline 58.51 min, +38%)
+      Wall time: 85.77 min
+      Per-layer GDN cost: ~42 ms/step (unoptimised, with conv)
 """
 
 import os
