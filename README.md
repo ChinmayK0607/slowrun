@@ -44,6 +44,7 @@ The limited-compute track caps runs at a single 8xH100 node for at most 1 hour.
 8 | 3.278 | Run layers 15-20 3 times before layers 21-29 for the last 3 epochs | 03/11/26 | 55.7 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/64be4733075251c7da1d8b25529963520b16cdb8/train.py) | [@akshayvegesna](https://x.com/akshayvegesna)
 9 | 3.276 | Add [exclusive self attention (XSA)](https://arxiv.org/pdf/2603.09078) | 03/12/26 | 57.7 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/ac968a62c633d75d972afa6d86a59f89e12997b9/train.py) | [@not-nonymous](https://github.com/not-nonymous)
 10 | 3.270 | LR tuning, warmdown tuning | 03/16/26 | 55.5 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/28152d9996d9e910d4fb1b4a569fae399c546d6b/train.py) | [@zhiweixx](https://x.com/zhiweixux)
+11 | 3.252 | EMA of weights, hyperparameter tuning | 03/18/26 | 59.2 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/3fb4428f67e77e3bec53d4eafbb2cfd6f999b684/train.py) | [@ChinmayK0607](https://x.com/ChinmayKak), [@ms337](https://x.com/madhavsinghal_)
 
 
 ### Tiny Track (15 minutes)
@@ -59,6 +60,7 @@ The tiny track caps runs at a single 8xH100 node for at most 15 minutes.
 5 | 3.383 | Update warmdown ratio | 03/06/26 | 14.6 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/56559aa8526708c107e1e28eb8fc4a1721bd9c67/tiny/train.py) | [@not-nonymous](https://github.com/not-nonymous)
 6 | 3.374 | Half truncated RoPE, partial key offset, residual lambdas to 1.1 | 03/06/26 | 14.8 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/ed62160275273197c3a996c4469d735a05c5eedb/tiny/train.py) | [@ChinmayK0607](https://x.com/ChinmayKak)
 7 | 3.365 | Add weight decay schedule | 03/15/26 | 14.8 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/42c39127d19bebbb806afd630fa852936da35562/tiny/train.py) | [@shmublu](https://x.com/ShmuelBerman)
+8 | 3.353 | Add EMA parameter averaging | 03/21/26 | 14.9 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/0092945e4bf570fdb90fbdf2f1b311361288ea0b/tiny/train.py) | [@clarkkev](https://github.com/clarkkev)
 
 
 
@@ -77,6 +79,8 @@ The tiny track caps runs at a single 8xH100 node for at most 15 minutes.
 5 | 3.166 | Train each model for 1.5x longer | 03/05/26 | 10h 35m | [Script](https://github.com/qlabs-eng/slowrun/blob/6848b4a7b4d1373dead2c7ceaaf47927762b86c8/unlimited/train.py) | [@akshayvegesna](https://x.com/akshayvegesna)
 6 | 3.126 | Train each model in ensemble to distill previous model + usual CE loss | 03/07/26 | 16h 1m | [Script](https://github.com/qlabs-eng/slowrun/blob/4eb2cce258b9edb97862f65349e130507d7c433c/unlimited/train.py) | [@not-nonymous](https://github.com/not-nonymous)
 7 | 3.089 | Ensemble of 10 models, looping of layers 15-20, tuned epoch counts, loss weight | 03/13/26 | 19h 18m (2 nodes, 8xH100) | [Script](https://github.com/qlabs-eng/slowrun/blob/5c6ecd540cd789eef50fe894302da82b670fcc93/unlimited/train.py) | [@akshayvegesna](https://x.com/akshayvegesna)
+8 | 3.081 | Ensemble of 12 models, distill alpha 0.5 | 03/18/26 | 42h 35m (1 node, 8xH100) | [Script](https://github.com/qlabs-eng/slowrun/blob/7dc6c386ae6ccf8bc8fa9b03cc53acf7723c4084/unlimited/train.py) | [@not-nonymous](https://github.com/not-nonymous)
+9 | 3.045 | More looping, hyperparam tuning, model size increase | 03/19/26 | ~44h (2 nodes, 8xH100) | [Script](https://github.com/qlabs-eng/slowrun/blob/fcfb67b230afcf2e1702936abc077defcf5f8657/unlimited/train.py) | [@akshayvegesna](https://x.com/akshayvegesna)
 
 
 
