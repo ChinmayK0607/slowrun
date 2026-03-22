@@ -5,3 +5,4 @@ numpy
 datasets
 tqdm
 kernels
+flash-linear-attention
