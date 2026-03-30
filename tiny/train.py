@@ -67,6 +67,16 @@ parser.add_argument("--wandb_group", type=str, default=None)
 parser.add_argument("--dropout", type=float, default=0.1)
 parser.add_argument("--update-ema-every", type=int, default=10)
 parser.add_argument("--ema-decay-per-epoch", type=float, default=0.15)
+# Curriculum learning: order training sequences by GPT-2 perplexity
+parser.add_argument("--curriculum-scores", type=str, default=None,
+                    help="Path to per-sequence perplexity scores tensor")
+parser.add_argument("--curriculum-mode", type=str, default="random",
+                    choices=["random", "easy2hard", "hard2easy", "adaptive"],
+                    help="Data ordering strategy")
+parser.add_argument("--curriculum-easy-epochs", type=int, default=4,
+                    help="Epochs of easy-first ordering (adaptive mode)")
+parser.add_argument("--curriculum-hard-epochs", type=int, default=4,
+                    help="Epochs of hard-first ordering at end (adaptive mode)")
 args = parser.parse_args()
 
 # Resolve output path
@@ -424,14 +434,19 @@ class GPT(nn.Module):
 # Optimizer: MuonAdamW (Muon for matrices, AdamW for embeddings/scalars)
 # =============================================================================
 
-# Polar Express coefficients for orthogonalization
-polar_express_coeffs = [
-    (8.156554524902461, -22.48329292557795, 15.878769915207462),
-    (4.042929935166739, -2.808917465908714, 0.5000178451051316),
-    (3.8916678022926607, -2.772484153217685, 0.5060648178503393),
-    (3.285753657755655, -2.3681294933425376, 0.46449024233003106),
-    (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
-]
+# Gram Newton-Schulz with CuTeDSL symmetric kernels (Dao-AILab/gram-newton-schulz)
+from gram_newton_schulz import GramNewtonSchulz, POLAR_EXPRESS_COEFFICIENTS
+_gns_orthogonalizer = None
+
+def _get_gns():
+    global _gns_orthogonalizer
+    if _gns_orthogonalizer is None:
+        _gns_orthogonalizer = GramNewtonSchulz(
+            ns_coefficients=POLAR_EXPRESS_COEFFICIENTS,
+            gram_newton_schulz_reset_iterations=[2],
+            ns_use_kernels=True,
+        )
+    return _gns_orthogonalizer
 
 @torch.compile(dynamic=False, fullgraph=True)
 def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t):
@@ -443,24 +458,15 @@ def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_
     p.add_(exp_avg / ((exp_avg_sq / bias2).sqrt() + eps_t), alpha=-(lr_t / bias1))
 
 @torch.compile(dynamic=False, fullgraph=True)
-def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momentum_buffer,
-                    momentum_t, lr_t, wd_t, beta2_t, ns_steps, red_dim):
+def muon_momentum_fused(stacked_grads, momentum_buffer, momentum_t):
+    """Apply momentum to stacked gradients. Returns momentum-applied grads."""
     momentum = momentum_t.to(stacked_grads.dtype)
     momentum_buffer.lerp_(stacked_grads, 1 - momentum)
-    g = stacked_grads.lerp_(momentum_buffer, momentum)
-    # Polar Express orthogonalization
-    X = g.bfloat16()
-    X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.02 + 1e-6)
-    if g.size(-2) > g.size(-1):
-        for a, b, c in polar_express_coeffs[:ns_steps]:
-            A = X.mT @ X
-            X = a * X + X @ (b * A + c * (A @ A))
-    else:
-        for a, b, c in polar_express_coeffs[:ns_steps]:
-            A = X @ X.mT
-            X = a * X + (b * A + c * (A @ A)) @ X
-    g = X
-    # Variance reduction
+    return stacked_grads.lerp_(momentum_buffer, momentum)
+
+@torch.compile(dynamic=False, fullgraph=True)
+def muon_update_fused(g, stacked_params, second_momentum_buffer, lr_t, wd_t, beta2_t, red_dim):
+    """Variance reduction + cautious weight decay + parameter update."""
     beta2 = beta2_t.to(g.dtype)
     v_mean = g.float().square().mean(dim=red_dim, keepdim=True)
     red_dim_size = g.size(red_dim)
@@ -472,7 +478,6 @@ def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momen
     v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt()
     final_scale = step_size * (v_norm / v_norm_new.clamp_min(1e-10))
     g = g * final_scale.to(g.dtype)
-    # Cautious weight decay + update
     lr = lr_t.to(g.dtype)
     wd = wd_t.to(g.dtype)
     mask = (g * stacked_params) >= 0
@@ -573,10 +578,15 @@ class DistMuonAdamW(torch.optim.Optimizer):
             self._muon_beta2_t.fill_(group["beta2"])
             self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
             self._muon_wd_t.fill_(group["weight_decay"])
-            muon_step_fused(info['grad_chunk'][:num_owned], owned,
-                          state["momentum_buffer"][:num_owned], state["second_momentum_buffer"][:num_owned],
-                          self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t, self._muon_beta2_t,
-                          group["ns_steps"], red_dim)
+            # Phase 1: momentum
+            g = muon_momentum_fused(info['grad_chunk'][:num_owned],
+                                    state["momentum_buffer"][:num_owned],
+                                    self._muon_momentum_t)
+            # Phase 2: Gram Newton-Schulz orthogonalization (CuTeDSL symmetric kernels)
+            g = _get_gns()(g)
+            # Phase 3: variance reduction + cautious WD + update
+            muon_update_fused(g, owned, state["second_momentum_buffer"][:num_owned],
+                              self._muon_lr_t, self._muon_wd_t, self._muon_beta2_t, red_dim)
             updated[:num_owned].copy_(owned)
         if num_owned < chunk_size:
             updated[num_owned:].zero_()
@@ -604,9 +614,22 @@ class DistMuonAdamW(torch.optim.Optimizer):
 # =============================================================================
 
 class DataLoader:
-    """Pre-tokenized chunk dataloader. Yields (inputs, targets, epoch) forever."""
+    """Pre-tokenized chunk dataloader. Yields (inputs, targets, epoch) forever.
 
-    def __init__(self, filepath, B, T, device="cuda"):
+    Supports curriculum learning: when scores are provided, sequences can be
+    ordered by GPT-2 perplexity instead of randomly shuffled.
+
+    Modes:
+      - random: standard random shuffle each epoch (default)
+      - easy2hard: ascending perplexity order every epoch (block-shuffled)
+      - hard2easy: descending perplexity order every epoch (block-shuffled)
+      - adaptive: easy-first for first N epochs, random in middle, hard-first
+                  for last M epochs
+    """
+
+    def __init__(self, filepath, B, T, device="cuda",
+                 scores_path=None, curriculum_mode="random",
+                 easy_epochs=4, hard_epochs=4, num_epochs=16):
         data = torch.load(filepath, weights_only=True)
         chunks = data['chunks']
         valid_counts = data['valid_counts']
@@ -620,30 +643,111 @@ class DataLoader:
             rows = chunk.view(file_B, sequence_size)[:vc]
             all_seqs.append(rows)
         all_seqs = torch.cat(all_seqs, dim=0).long()  # (N, T+1)
+        N = len(all_seqs)
 
         # DDP sharding: each rank gets every world_size-th batch
         _, rank, _, world_size = get_dist_info()
         seqs_per_step = B * world_size
-        num_steps = len(all_seqs) // seqs_per_step
+        num_steps = N // seqs_per_step
         usable = num_steps * seqs_per_step
-        all_seqs = all_seqs[:usable].view(num_steps, world_size, B, sequence_size)
 
+        # Load perplexity scores for curriculum ordering
+        self.curriculum_mode = curriculum_mode
+        self.easy_epochs = easy_epochs
+        self.hard_epochs = hard_epochs
+        self.num_epochs = num_epochs
+        self.scores = None
+        self.sorted_asc = None   # indices sorted by ascending perplexity
+        self.sorted_desc = None  # indices sorted by descending perplexity
+
+        if scores_path is not None and curriculum_mode != "random":
+            raw_scores = torch.load(scores_path, weights_only=True)
+            assert len(raw_scores) >= N, (
+                f"Scores ({len(raw_scores)}) must cover all sequences ({N})")
+            # Only sort within the usable subset so indices stay in [0, usable)
+            self.scores = raw_scores[:usable]
+            self.sorted_asc = torch.argsort(self.scores)       # easy→hard
+            self.sorted_desc = torch.argsort(self.scores, descending=True)
+            print0(f"Curriculum: {curriculum_mode} mode, "
+                   f"{usable} usable seqs scored (of {N}), "
+                   f"ppl range [{self.scores.min():.2f}, {self.scores.max():.2f}]")
+
+        # Initial shaping (will be re-ordered in _shuffle)
+        all_seqs = all_seqs[:usable].view(num_steps, world_size, B, sequence_size)
+        self.all_data = all_seqs  # keep flat reference for curriculum reordering
+        self.B = B
+        self.world_size = world_size
+        self.rank = rank
+        self.sequence_size = sequence_size
         self.rank_data = all_seqs[:, rank].contiguous()  # (num_steps, B, T+1)
         self.num_steps = num_steps
         self.total_tokens = usable * T  # trainable tokens across all ranks
         self.device = device
         self.pos = 0
         self.epoch = 1
+        # Keep a flat (usable, T+1) reference for score-based reordering
+        self._flat_seqs = all_seqs.view(usable, sequence_size)
 
     def __iter__(self):
         return self
 
+    def _get_epoch_mode(self, epoch):
+        """Determine ordering mode for a given epoch."""
+        if self.curriculum_mode == "random" or self.scores is None:
+            return "random"
+        elif self.curriculum_mode == "easy2hard":
+            return "easy2hard"
+        elif self.curriculum_mode == "hard2easy":
+            return "hard2easy"
+        elif self.curriculum_mode == "adaptive":
+            if epoch <= self.easy_epochs:
+                return "easy2hard"
+            elif epoch > self.num_epochs - self.hard_epochs:
+                return "hard2easy"
+            else:
+                return "random"
+        return "random"
+
     def _shuffle(self):
-        """Shuffle batch order for the new epoch, consistent across ranks."""
-        g = torch.Generator()
-        g.manual_seed(self.epoch)
-        perm = torch.randperm(self.num_steps, generator=g)
-        self.rank_data = self.rank_data[perm]
+        """Shuffle or sort batch order for the new epoch, consistent across ranks."""
+        mode = self._get_epoch_mode(self.epoch)
+        seqs_per_step = self.B * self.world_size
+        usable = self.num_steps * seqs_per_step
+
+        if mode == "random":
+            # Standard random shuffle at batch level
+            g = torch.Generator()
+            g.manual_seed(self.epoch)
+            perm = torch.randperm(self.num_steps, generator=g)
+            self.rank_data = self.all_data[perm][:, self.rank].contiguous()
+        else:
+            # Score-based ordering with block-level shuffle for variety
+            if mode == "easy2hard":
+                seq_order = self.sorted_asc
+            else:  # hard2easy
+                seq_order = self.sorted_desc
+
+            # Reorder sequences, then reshape into (num_steps, world_size, B, T+1)
+            ordered = self._flat_seqs[seq_order].view(
+                self.num_steps, self.world_size, self.B, self.sequence_size)
+
+            # Block shuffle: divide into 8 blocks, shuffle within each block
+            # This preserves the global ordering direction while adding
+            # local variety across epochs to prevent memorization
+            n_blocks = 8
+            block_size = self.num_steps // n_blocks
+            g = torch.Generator()
+            g.manual_seed(self.epoch)
+            for b in range(n_blocks):
+                start = b * block_size
+                end = start + block_size if b < n_blocks - 1 else self.num_steps
+                local_perm = torch.randperm(end - start, generator=g)
+                ordered[start:end] = ordered[start + local_perm]
+
+            self.rank_data = ordered[:, self.rank].contiguous()
+
+        if self.epoch <= 3 or self.epoch >= self.num_epochs - 1:
+            print0(f"  Epoch {self.epoch}: data order = {mode}")
 
     def __next__(self):
         if self.pos >= self.num_steps:
@@ -786,7 +890,14 @@ optimizer = model.setup_optimizer()
 # Dataloaders
 _train_path = args.input_bin if args.input_bin else os.path.join(DATA_DIR, "fineweb_train.pt")
 _val_path = args.input_val_bin if args.input_val_bin else os.path.join(DATA_DIR, "fineweb_val.pt")
-train_loader = DataLoader(_train_path, args.device_batch_size, MAX_SEQ_LEN, device=device)
+train_loader = DataLoader(
+    _train_path, args.device_batch_size, MAX_SEQ_LEN, device=device,
+    scores_path=args.curriculum_scores,
+    curriculum_mode=args.curriculum_mode,
+    easy_epochs=args.curriculum_easy_epochs,
+    hard_epochs=args.curriculum_hard_epochs,
+    num_epochs=args.num_epochs,
+)
 build_val_loader = lambda: DataLoader(_val_path, args.device_batch_size, MAX_SEQ_LEN, device=device)
 TOKENS_PER_EPOCH = train_loader.total_tokens
 x, y, current_epoch = next(train_loader)
