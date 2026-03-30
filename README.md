@@ -24,6 +24,16 @@ python prepare_data.py
 torchrun --standalone --nproc_per_node=8 train.py
 ```
 
+### Tiny Track setup
+
+The tiny track uses [Gram Newton-Schulz](https://github.com/Dao-AILab/gram-newton-schulz) for faster Muon orthogonalization with CuTeDSL symmetric GEMM kernels. Requires an NVIDIA Hopper (H100) or Blackwell GPU, PyTorch 2.7.1+, CUDA 12.9+, and Python ≥ 3.12.
+
+```bash
+git clone https://github.com/Dao-AILab/gram-newton-schulz.git
+pip install ./gram-newton-schulz --no-build-isolation
+torchrun --standalone --nproc_per_node=8 tiny/train.py
+```
+
 ## World Record History
 
 We accept PRs that achieve a new World Record validation loss within the track's time limit, and add an entry below for each improvement.
