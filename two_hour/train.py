@@ -466,7 +466,7 @@ class GPT(nn.Module):
 
     def _run_decoder_layers(self, x, x0, encoder_outputs, start, end, T):
         """Run decoder layers [start, end), with U-Net skip connections."""
-        cos_sin = (self.cos[:, :T], self.sin[:, :T])
+        cos_sin = self.cos[:, :T], self.sin[:, :T]
         for i in range(start, end):
             # Encoder layer j connects to decoder layer (n_layer - 1 - j)
             j = self.config.n_layer - 1 - i
@@ -481,7 +481,7 @@ class GPT(nn.Module):
         B, T = idx.size()
         x = norm(self.transformer.wte(idx))
         x0 = x
-        cos_sin = (self.cos[:, :T], self.sin[:, :T])
+        cos_sin = self.cos[:, :T], self.sin[:, :T]
 
         # Encoder half: run layers and collect outputs for skip connections
         encoder_outputs = []
@@ -559,6 +559,8 @@ def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momen
     momentum = momentum_t.to(stacked_grads.dtype)
     momentum_buffer.lerp_(stacked_grads, 1 - momentum)
     g = stacked_grads.lerp_(momentum_buffer, momentum)
+    # MuonEq-R row normalization
+    g /= g.float().norm(dim=-1, keepdim=True).clamp_min(1e-7).to(g.dtype)
     # Polar Express orthogonalization
     X = g.bfloat16()
     X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.02 + 1e-6)
@@ -684,9 +686,9 @@ class DistMuonAdamW(torch.optim.Optimizer):
             self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
             self._muon_wd_t.fill_(group["weight_decay"])
             muon_step_fused(info['grad_chunk'][:num_owned], owned,
-                          state["momentum_buffer"][:num_owned], state["second_momentum_buffer"][:num_owned],
-                          self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t, self._muon_beta2_t,
-                          group["ns_steps"], red_dim)
+                            state["momentum_buffer"][:num_owned], state["second_momentum_buffer"][:num_owned],
+                            self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t, self._muon_beta2_t,
+                            group["ns_steps"], red_dim)
             updated[:num_owned].copy_(owned)
         if num_owned < chunk_size:
             updated[num_owned:].zero_()
@@ -942,7 +944,9 @@ token_bytes = torch.tensor(token_bytes_list, dtype=torch.int32, device=device)
 
 # Build model
 config = GPTConfig(vocab_size=vocab_size, dropout=args.dropout,
-                   stoch_depth=args.stoch_depth, use_iha=args.iha)
+                   stoch_depth=args.stoch_depth,
+                   use_iha=args.iha,
+                   iha_mix_v=args.iha)
 with torch.device("meta"):
     model = GPT(config)
 model.to_empty(device=device)
