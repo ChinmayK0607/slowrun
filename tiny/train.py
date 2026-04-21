@@ -65,13 +65,6 @@ parser.add_argument("--input_val_bin", type=str, default=None)
 parser.add_argument("--output_json", type=str, default=None)
 parser.add_argument("--wandb_group", type=str, default=None)
 parser.add_argument("--dropout", type=float, default=0.1)
-parser.add_argument("--seed", type=int, default=42)
-parser.add_argument("--iha", action="store_true", default=True,
-                    help="Enable Interleaved Head Attention (cross-head Q/K/V mixing)")
-parser.add_argument("--no-iha", action="store_false", dest="iha",
-                    help="Disable IHA cross-head mixing")
-parser.add_argument("--iha-lr", type=float, default=0.02,
-                    help="LR for IHA mixing matrices")
 parser.add_argument("--muon-eq-r", action="store_true", dest="muon_eq_r", default=True,
                     help="Enable MuonEq-R row normalization in the Muon path")
 parser.add_argument("--no-muon-eq-r", action="store_false", dest="muon_eq_r",
@@ -200,8 +193,6 @@ class GPTConfig:
     n_embd: int = N_EMBD
     window_pattern: str = WINDOW_PATTERN
     dropout: float = 0.1
-    use_iha: bool = False
-    iha_mix_v: bool = True
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
@@ -234,39 +225,16 @@ class CausalSelfAttention(nn.Module):
         # Per-head attention gate: enables context-based attention no-op
         self.attn_gate_channels = 12
         self.attn_gate = nn.Linear(self.attn_gate_channels, self.n_head, bias=False)
-        # IHA: cross-head mixing matrices fused into projection weights at forward time.
-        self.use_iha = config.use_iha
-        if self.use_iha:
-            self.q_mix = nn.Parameter(torch.zeros(self.n_head, self.n_head))
-            self.k_mix = nn.Parameter(torch.zeros(self.n_kv_head, self.n_kv_head))
-            self.iha_mix_v = config.iha_mix_v
-            if self.iha_mix_v:
-                self.v_mix = nn.Parameter(torch.zeros(self.n_kv_head, self.n_kv_head))
         # Determine if this is a long-window layer for partial key offset
         pattern = config.window_pattern.upper()
         char = pattern[layer_idx % len(pattern)]
         self.use_key_offset = (char == 'L') or (layer_idx == config.n_layer - 1)
 
-    def _fuse_mix(self, weight, mix, H):
-        d = self.head_dim
-        return (mix @ weight.view(H, d, -1).flatten(1)).view_as(weight)
-
     def forward(self, x, ve, cos_sin, window_size):
         B, T, C = x.size()
-        if self.use_iha:
-            q = F.linear(x, self._fuse_mix(self.c_q.weight, self.q_mix, self.n_head))
-            q = q.view(B, T, self.n_head, self.head_dim)
-            k = F.linear(x, self._fuse_mix(self.c_k.weight, self.k_mix, self.n_kv_head))
-            k = k.view(B, T, self.n_kv_head, self.head_dim)
-            if self.iha_mix_v:
-                v = F.linear(x, self._fuse_mix(self.c_v.weight, self.v_mix, self.n_kv_head))
-                v = v.view(B, T, self.n_kv_head, self.head_dim)
-            else:
-                v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
-        else:
-            q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
-            k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
-            v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
+        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
+        k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
+        v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
         # Value residual (ResFormer)
         if ve is not None:
             ve = ve.view(B, T, self.n_kv_head, self.head_dim)
@@ -348,11 +316,6 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.mlp.c_gate.weight, -s, s)
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
-            if block.attn.use_iha:
-                torch.nn.init.eye_(block.attn.q_mix)
-                torch.nn.init.eye_(block.attn.k_mix)
-                if block.attn.iha_mix_v:
-                    torch.nn.init.eye_(block.attn.v_mix)
 
         self.resid_lambdas.fill_(1.1)
         self.x0_lambdas.fill_(0.1)
@@ -412,20 +375,11 @@ class GPT(nn.Module):
 
     def setup_optimizer(self):
         ddp, rank, local_rank, world_size = get_dist_info()
-        # Separate attn_gate + IHA mixing params (small, Adam-optimized) from matrix params (Muon)
+        # Separate attn_gate params (small, Adam-optimized) from matrix params (Muon)
         attn_gate_params = [block.attn.attn_gate.weight for block in self.transformer.h]
-        special_ids = {id(p) for p in attn_gate_params}
-        iha_params = []
-        for block in self.transformer.h:
-            if block.attn.use_iha:
-                iha_params.extend([block.attn.q_mix, block.attn.k_mix])
-                special_ids.add(id(block.attn.q_mix))
-                special_ids.add(id(block.attn.k_mix))
-                if block.attn.iha_mix_v:
-                    iha_params.append(block.attn.v_mix)
-                    special_ids.add(id(block.attn.v_mix))
+        attn_gate_ids = {id(p) for p in attn_gate_params}
         all_h_params = list(self.transformer.h.parameters()) + list(self.ve_projs.parameters())
-        matrix_params = [p for p in all_h_params if id(p) not in special_ids]
+        matrix_params = [p for p in all_h_params if id(p) not in attn_gate_ids]
         embed_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
@@ -440,9 +394,6 @@ class GPT(nn.Module):
             dict(kind='adamw', params=skip_params, lr=SCALAR_LR * 0.01, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=attn_gate_params, lr=SCALAR_LR, betas=(0.9, 0.99), eps=1e-10, weight_decay=0.0),
         ]
-        if iha_params:
-            param_groups.append(dict(kind='adamw', params=iha_params, lr=args.iha_lr,
-                                     betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0))
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
             param_groups.append(dict(kind='muon', params=group_params, lr=MATRIX_LR,
@@ -701,7 +652,7 @@ class DistMuonAdamW(torch.optim.Optimizer):
 class DataLoader:
     """Pre-tokenized chunk dataloader. Yields (inputs, targets, epoch) forever."""
 
-    def __init__(self, filepath, B, T, device="cuda", seed=42):
+    def __init__(self, filepath, B, T, device="cuda"):
         data = torch.load(filepath, weights_only=True)
         chunks = data['chunks']
         valid_counts = data['valid_counts']
@@ -727,7 +678,6 @@ class DataLoader:
         self.num_steps = num_steps
         self.total_tokens = usable * T  # trainable tokens across all ranks
         self.device = device
-        self.seed = seed
         self.pos = 0
         self.epoch = 1
 
@@ -737,7 +687,7 @@ class DataLoader:
     def _shuffle(self):
         """Shuffle batch order for the new epoch, consistent across ranks."""
         g = torch.Generator()
-        g.manual_seed(self.seed + self.epoch)
+        g.manual_seed(self.epoch)
         perm = torch.randperm(self.num_steps, generator=g)
         self.rank_data = self.rank_data[perm]
 
@@ -791,12 +741,12 @@ def evaluate_bpb(model, batches, steps, token_bytes):
 # Compute init
 ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
 master_process = ddp_rank == 0
-torch.manual_seed(args.seed)
+torch.manual_seed(42)
 
 if ddp and torch.cuda.is_available():
     device = torch.device("cuda", ddp_local_rank)
     torch.cuda.set_device(device)
-    torch.cuda.manual_seed(args.seed)
+    torch.cuda.manual_seed(42)
     dist.init_process_group(backend="nccl", device_id=device)
     dist.barrier()
 else:
@@ -834,7 +784,6 @@ if master_process:
 print0(f"--- Hyperparameters ---")
 print0(f"  n_layer={DEPTH}, n_embd={N_EMBD}, n_head={N_HEAD}, head_dim={HEAD_DIM}")
 print0(f"  seq_len={MAX_SEQ_LEN}, window_pattern={WINDOW_PATTERN}")
-print0(f"  iha={args.iha}, iha_lr={args.iha_lr}")
 print0(f"  muon_eq_r={args.muon_eq_r}")
 print0(f"  total_batch_size={TOTAL_BATCH_SIZE}, device_batch_size={args.device_batch_size}")
 print0(f"  matrix_lr={MATRIX_LR}, scalar_lr={SCALAR_LR}, embedding_lr={EMBEDDING_LR}, unembedding_lr={UNEMBEDDING_LR}")
@@ -842,7 +791,6 @@ print0(f"  weight_decay={WEIGHT_DECAY}, adam_betas={ADAM_BETAS}")
 print0(f"  warmup_ratio={WARMUP_RATIO}, warmdown_ratio={WARMDOWN_RATIO}, final_lr_frac={FINAL_LR_FRAC}")
 print0(f"  num_epochs={args.num_epochs}, patience={args.patience}")
 print0(f"  dropout={args.dropout}")
-print0(f"  seed={args.seed}")
 print0(f"-----------------------")
 
 # Load GPT-2 tokenizer and compute token_bytes for BPB evaluation
@@ -860,7 +808,7 @@ for i in range(vocab_size):
 token_bytes = torch.tensor(token_bytes_list, dtype=torch.int32, device=device)
 
 # Build model
-config = GPTConfig(vocab_size=vocab_size, dropout=args.dropout, use_iha=args.iha)
+config = GPTConfig(vocab_size=vocab_size, dropout=args.dropout)
 with torch.device("meta"):
     model = GPT(config)
 model.to_empty(device=device)
@@ -885,8 +833,8 @@ optimizer = model.setup_optimizer()
 # Dataloaders
 _train_path = args.input_bin if args.input_bin else os.path.join(DATA_DIR, "fineweb_train.pt")
 _val_path = args.input_val_bin if args.input_val_bin else os.path.join(DATA_DIR, "fineweb_val.pt")
-train_loader = DataLoader(_train_path, args.device_batch_size, MAX_SEQ_LEN, device=device, seed=args.seed)
-build_val_loader = lambda: DataLoader(_val_path, args.device_batch_size, MAX_SEQ_LEN, device=device, seed=args.seed)
+train_loader = DataLoader(_train_path, args.device_batch_size, MAX_SEQ_LEN, device=device)
+build_val_loader = lambda: DataLoader(_val_path, args.device_batch_size, MAX_SEQ_LEN, device=device)
 TOKENS_PER_EPOCH = train_loader.total_tokens
 x, y, current_epoch = next(train_loader)
 
