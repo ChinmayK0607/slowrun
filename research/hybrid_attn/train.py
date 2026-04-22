@@ -3,13 +3,7 @@ Train a language model on ~100M tokens with val loss evaluation.
 Code is based on Nanochat (https://github.com/karpathy/nanochat), with modifications to support the slowrun setting.
 
 Usage:
-   torchrun --standalone --nproc_per_node=8 train.py --gdn-layers "1,3,5,7,9,11,13,16,18,20,22,24,26,28"
-   Performance reference (8×H100, 12 epochs, alternating-14 layout):
-      Config: --gdn-layers 1,3,5,6,8,10,11,13,15,16,18,20,22,23 (14 GDN / 16 softmax)
-      Min val BPB: 1.053290                                                                                                                    
-      Min val Loss: 3.241282 
-      Total training time: 72.33m                                                                                                                                                              json                                       
-      Total wall time: 4614.82s (76.91m)     
+   torchrun --standalone --nproc_per_node=8 train.py --gdn-layers "1,3,5,7,9,11,13,16,18,20,22,24,26,28"  
 """
 
 import os
@@ -34,6 +28,7 @@ import tiktoken
 
 # Gated Delta Net kernels (flash-linear-attention)
 from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
+from fla.ops.kda import chunk_kda
 
 _script_start = time.time()
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -94,6 +89,8 @@ parser.add_argument("--gdn-use-recurrent", action="store_true",
                     help="Use the experimental fused recurrent GDN kernel instead of chunked mode")
 parser.add_argument("--gdn-profile", action="store_true",
                     help="Enable lightweight GDN timing attribution (runs in eager mode)")
+parser.add_argument("--linear-attn-type", type=str, default="gdn", choices=("gdn", "kda"),
+                    help="Linear-attention block to use on the layers selected by --gdn-layers")
 args = parser.parse_args()
 
 # Resolve output path
@@ -299,6 +296,7 @@ class GPTConfig:
     gdn_no_conv: bool = False
     gdn_use_recurrent: bool = False
     gdn_profile: bool = False
+    linear_attn_type: str = "gdn"
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
@@ -489,6 +487,131 @@ class GatedDeltaNetAttention(nn.Module):
         return self.resid_dropout(self.o_proj(o))
 
 
+class KimiDeltaAttention(nn.Module):
+    """KDA block with a FlashKDA-compatible chunk_kda call shape.
+
+    Training uses the FLA Triton autograd path. Eval/no-grad can auto-dispatch
+    to FlashKDA when the external package is installed.
+    """
+
+    def __init__(self, config, layer_idx):
+        super().__init__()
+        self.n_embd = config.n_embd
+        self.num_heads = config.n_head
+        self.head_k_dim = config.n_embd // config.n_head
+        self.head_v_dim = self.head_k_dim
+        self.key_dim = self.num_heads * self.head_k_dim
+        self.value_dim = self.num_heads * self.head_v_dim
+        self.layer_idx = layer_idx
+        self.use_short_conv = not config.gdn_no_conv
+        self.safe_gate = True
+        self.lower_bound = -5.0
+
+        self.q_proj = nn.Linear(config.n_embd, self.key_dim, bias=False)
+        self.k_proj = nn.Linear(config.n_embd, self.key_dim, bias=False)
+        self.v_proj = nn.Linear(config.n_embd, self.value_dim, bias=False)
+        self.f_proj = nn.Sequential(
+            nn.Linear(config.n_embd, self.head_v_dim, bias=False),
+            nn.Linear(self.head_v_dim, self.key_dim, bias=False),
+        )
+        self.b_proj = nn.Linear(config.n_embd, self.num_heads, bias=False)
+        self.g_proj = nn.Sequential(
+            nn.Linear(config.n_embd, self.head_v_dim, bias=False),
+            nn.Linear(self.head_v_dim, self.value_dim, bias=False),
+        )
+        self.o_proj = nn.Linear(self.value_dim, config.n_embd, bias=False)
+
+        self.A_log = nn.Parameter(torch.zeros(self.num_heads, dtype=torch.float32))
+        self.A_log._no_weight_decay = True
+
+        dt = torch.exp(
+            torch.rand(self.key_dim, dtype=torch.float32) * (math.log(0.1) - math.log(0.001))
+            + math.log(0.001)
+        ).clamp(min=1e-4)
+        inv_dt = dt + torch.log(-torch.expm1(-dt))
+        self.dt_bias = nn.Parameter(inv_dt)
+        self.dt_bias._no_weight_decay = True
+
+        self.conv_size = 4
+        if self.use_short_conv:
+            self.q_conv = nn.Conv1d(self.key_dim, self.key_dim, self.conv_size,
+                                   padding=self.conv_size - 1, groups=self.key_dim, bias=False)
+            self.k_conv = nn.Conv1d(self.key_dim, self.key_dim, self.conv_size,
+                                   padding=self.conv_size - 1, groups=self.key_dim, bias=False)
+            self.v_conv = nn.Conv1d(self.value_dim, self.value_dim, self.conv_size,
+                                   padding=self.conv_size - 1, groups=self.value_dim, bias=False)
+        else:
+            self.q_conv = None
+            self.k_conv = None
+            self.v_conv = None
+
+        self.resid_dropout = nn.Dropout(config.dropout)
+
+    def _apply_short_conv(self, x, conv, T):
+        if conv is None:
+            return F.silu(x)
+        return F.silu(conv(x.transpose(1, 2))[:, :, :T].transpose(1, 2))
+
+    def forward(self, x, ve, cos_sin, window_size):
+        del ve, cos_sin, window_size
+        B, T, C = x.size()
+
+        with gdn_profiler.section("kda/proj"):
+            q = self.q_proj(x)
+            k = self.k_proj(x)
+            v = self.v_proj(x)
+            g = self.f_proj(x)
+            beta = self.b_proj(x)
+            g_out = self.g_proj(x)
+
+        with gdn_profiler.section("kda/conv"):
+            q = self._apply_short_conv(q, self.q_conv, T)
+            k = self._apply_short_conv(k, self.k_conv, T)
+            v = self._apply_short_conv(v, self.v_conv, T)
+
+        q = q.view(B, T, self.num_heads, self.head_k_dim).contiguous()
+        k = k.view(B, T, self.num_heads, self.head_k_dim).contiguous()
+        v = v.view(B, T, self.num_heads, self.head_v_dim).contiguous()
+        g = g.view(B, T, self.num_heads, self.head_k_dim).contiguous()
+        beta_logits = beta.contiguous()
+
+        use_flashkda_compatible_eval = not torch.is_grad_enabled()
+        if use_flashkda_compatible_eval:
+            beta = beta_logits.to(q.dtype)
+            use_beta_sigmoid_in_kernel = True
+            transpose_state_layout = True
+        else:
+            beta = torch.sigmoid(beta_logits).to(q.dtype)
+            use_beta_sigmoid_in_kernel = False
+            transpose_state_layout = False
+
+        with gdn_profiler.section("kda/kernel"):
+            o, _ = chunk_kda(
+                q=q,
+                k=k,
+                v=v,
+                g=g.to(q.dtype),
+                beta=beta,
+                A_log=self.A_log,
+                dt_bias=self.dt_bias,
+                scale=self.head_k_dim ** -0.5,
+                output_final_state=False,
+                use_qk_l2norm_in_kernel=True,
+                use_gate_in_kernel=True,
+                use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
+                safe_gate=self.safe_gate,
+                lower_bound=self.lower_bound,
+                transpose_state_layout=transpose_state_layout,
+            )
+
+        with gdn_profiler.section("kda/output"):
+            g_out = g_out.view(B, T, self.num_heads, self.head_v_dim)
+            o = F.rms_norm(o, (self.head_v_dim,)) * torch.sigmoid(g_out)
+
+        o = o.reshape(B, T, self.value_dim)
+        return self.resid_dropout(self.o_proj(o))
+
+
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -504,9 +627,13 @@ class MLP(nn.Module):
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
-        self.is_gdn = config.gdn_layers is not None and layer_idx in config.gdn_layers
+        self.is_linear_attn = config.gdn_layers is not None and layer_idx in config.gdn_layers
+        self.is_gdn = self.is_linear_attn and config.linear_attn_type == "gdn"
+        self.is_kda = self.is_linear_attn and config.linear_attn_type == "kda"
         if self.is_gdn:
             self.attn = GatedDeltaNetAttention(config, layer_idx)
+        elif self.is_kda:
+            self.attn = KimiDeltaAttention(config, layer_idx)
         else:
             self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
@@ -583,6 +710,25 @@ class GPT(nn.Module):
                 for conv in [attn.q_conv, attn.k_conv, attn.v_conv]:
                     if conv is not None:
                         torch.nn.init.normal_(conv.weight, std=0.02)
+            elif block.is_kda:
+                attn = block.attn
+                torch.nn.init.uniform_(attn.q_proj.weight, -s, s)
+                torch.nn.init.uniform_(attn.k_proj.weight, -s, s)
+                torch.nn.init.uniform_(attn.v_proj.weight, -s, s)
+                torch.nn.init.uniform_(attn.f_proj[0].weight, -s, s)
+                torch.nn.init.uniform_(attn.f_proj[1].weight, -s, s)
+                torch.nn.init.uniform_(attn.b_proj.weight, -s, s)
+                torch.nn.init.uniform_(attn.g_proj[0].weight, -s, s)
+                torch.nn.init.uniform_(attn.g_proj[1].weight, -s, s)
+                torch.nn.init.zeros_(attn.o_proj.weight)
+                attn.A_log.zero_()
+                dt = torch.exp(
+                    torch.rand_like(attn.dt_bias) * (math.log(0.1) - math.log(0.001)) + math.log(0.001)
+                ).clamp(min=1e-4)
+                attn.dt_bias.copy_(dt + torch.log(-torch.expm1(-dt)))
+                for conv in [attn.q_conv, attn.k_conv, attn.v_conv]:
+                    if conv is not None:
+                        torch.nn.init.normal_(conv.weight, std=0.02)
             else:
                 # Standard attention init
                 torch.nn.init.uniform_(block.attn.c_q.weight, -s, s)
@@ -597,7 +743,7 @@ class GPT(nn.Module):
         for proj in self.ve_projs.values():
             torch.nn.init.uniform_(proj.weight, -s, s)
         for block in self.transformer.h:
-            if not block.is_gdn:
+            if not block.is_linear_attn:
                 if block.attn.ve_gate is not None:
                     torch.nn.init.zeros_(block.attn.ve_gate.weight)
                 torch.nn.init.zeros_(block.attn.attn_gate.weight)
@@ -648,12 +794,15 @@ class GPT(nn.Module):
         gdn_scalar_ids = set()
         gdn_scalar_params = []
         for block in self.transformer.h:
-            if block.is_gdn:
-                for p in [block.attn.A_log, block.attn.dt_bias, block.attn.beta_bias]:
+            if block.is_linear_attn:
+                scalar_params = [block.attn.A_log, block.attn.dt_bias]
+                if hasattr(block.attn, "beta_bias"):
+                    scalar_params.append(block.attn.beta_bias)
+                for p in scalar_params:
                     gdn_scalar_ids.add(id(p))
                     gdn_scalar_params.append(p)
-                # b_proj bias is a tiny 1D vector — treat as scalar, not matrix
-                if block.attn.b_proj.bias is not None:
+                # Tiny 1D biases should stay on AdamW, not Muon.
+                if getattr(block.attn.b_proj, "bias", None) is not None:
                     gdn_scalar_ids.add(id(block.attn.b_proj.bias))
                     gdn_scalar_params.append(block.attn.b_proj.bias)
                 for conv in [block.attn.q_conv, block.attn.k_conv, block.attn.v_conv]:
@@ -1067,6 +1216,7 @@ print0(f"  weight_decay={WEIGHT_DECAY}, adam_betas={ADAM_BETAS}")
 print0(f"  warmup_ratio={WARMUP_RATIO}, warmdown_ratio={WARMDOWN_RATIO}, final_lr_frac={FINAL_LR_FRAC}")
 print0(f"  num_epochs={args.num_epochs}, patience={args.patience}")
 print0(f"  dropout={args.dropout}")
+print0(f"  linear_attn_type={args.linear_attn_type}")
 print0(f"  gdn_no_conv={args.gdn_no_conv}, gdn_use_recurrent={args.gdn_use_recurrent}, gdn_profile={args.gdn_profile}")
 print0(f"-----------------------")
 
@@ -1074,6 +1224,12 @@ if args.gdn_profile:
     print0("GDN profiling enabled; running in eager mode to keep section timings meaningful")
 if args.gdn_use_recurrent:
     print0("Experimental recurrent GDN kernel requested; chunk-kernel fallback remains enabled")
+if args.linear_attn_type == "kda" and args.gdn_use_recurrent:
+    raise RuntimeError("--gdn-use-recurrent is only implemented for --linear-attn-type gdn")
+if args.linear_attn_type == "kda" and HEAD_DIM != 128:
+    raise RuntimeError(
+        f"--linear-attn-type kda requires head_dim=128 for FlashKDA-compatible dispatch; got {HEAD_DIM}"
+    )
 
 def recurrent_gdn_backward_supported():
     if not args.gdn_use_recurrent:
@@ -1138,10 +1294,11 @@ else:
     gdn_layer_indices = [int(x.strip()) for x in args.gdn_layers.split(',') if x.strip()]
 
 if gdn_layer_indices:
-    print0(f"GatedDeltaNet layers ({len(gdn_layer_indices)}): {gdn_layer_indices}")
+    linear_attn_label = "GatedDeltaNet" if args.linear_attn_type == "gdn" else "KDA"
+    print0(f"{linear_attn_label} layers ({len(gdn_layer_indices)}): {gdn_layer_indices}")
     print0(f"Softmax attention layers ({DEPTH - len(gdn_layer_indices)}): {[i for i in range(DEPTH) if i not in gdn_layer_indices]}")
 else:
-    print0("All layers use standard softmax attention (no GDN)")
+    print0("All layers use standard softmax attention (no linear-attention layers)")
 
 # Build model
 config = GPTConfig(
@@ -1151,6 +1308,7 @@ config = GPTConfig(
     gdn_no_conv=args.gdn_no_conv,
     gdn_use_recurrent=args.gdn_use_recurrent,
     gdn_profile=args.gdn_profile,
+    linear_attn_type=args.linear_attn_type,
 )
 with torch.device("meta"):
     model = GPT(config)
