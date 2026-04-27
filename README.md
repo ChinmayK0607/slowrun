@@ -53,6 +53,8 @@ The limited-compute track caps runs at a single 8xH100 node for at most 1 hour.
 16 | 3.222 | Add multi-token prediction loss | 04/09/26 | 57.1 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/549997a53e88f9e6fed9ce18af86945e31257077/train.py) | [@clarkkev](https://github.com/clarkkev)
 17 | 3.214 | Add [Interleaved Head Attention (IHA)](https://arxiv.org/abs/2602.21371) | 04/13/26 | 58.9 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/bd719090f61d88659bc21e9d7b2e69f781231e75/train.py) | [@ms337](https://x.com/madhavsinghal_)
 18 | 3.211 | Add [MuonEq-R](https://arxiv.org/abs/2603.28254) | 04/17/26 | 59.4 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/a2ed9f4530d2dbd80b8cc0b8775659b196053277/train.py) | [@clarkkev](https://github.com/clarkkev)
+19 | 3.204 | Add document-level shuffling | 04/24/26 | 59.0 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/a4732774888d535f681295de4ef1c66a57a3cc60/train.py) | [@samacqua](https://x.com/Sam_Acqua)
+20 | 3.195 | Add weight decay schedule, adjust learning rate schedule | 04/26/26 | 59.0 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/571b296eda47bdd291937d017ea49f23317088cb/train.py) | [@shmublu](https://x.com/ShmuelBerman)
 
 
 ### Tiny Track (15 minutes)
@@ -70,6 +72,7 @@ The tiny track caps runs at a single 8xH100 node for at most 15 minutes.
 7 | 3.365 | Add weight decay schedule | 03/15/26 | 14.8 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/42c39127d19bebbb806afd630fa852936da35562/tiny/train.py) | [@shmublu](https://x.com/ShmuelBerman)
 8 | 3.353 | Add EMA parameter averaging | 03/18/26 | 14.9 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/0092945e4bf570fdb90fbdf2f1b311361288ea0b/tiny/train.py) | [@clarkkev](https://github.com/clarkkev)
 9 | 3.345 | Add [Stochastic Weight Averaging (SWA)](https://arxiv.org/pdf/1803.05407) | 04/01/26 | 14.6 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/e094217e7a1abffae5b3ee06737b6d1747d76a48/tiny/train.py) | [@shmublu](https://x.com/ShmuelBerman)
+10 | 3.332 | Add document-level shuffling | 04/24/26 | 14.7 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/a4732774888d535f681295de4ef1c66a57a3cc60/tiny/train.py) | [@samacqua](https://x.com/Sam_Acqua)
 
 
 
@@ -98,6 +101,7 @@ The two hour track caps runs at a single 8xH100 node for at most two hours.
 8 | 3.081 | Ensemble of 12 models, distill alpha 0.5 | 03/18/26 | 42h 35m (1 node, 8xH100) | [Script](https://github.com/qlabs-eng/slowrun/blob/7dc6c386ae6ccf8bc8fa9b03cc53acf7723c4084/unlimited/train.py) | [@not-nonymous](https://github.com/not-nonymous)
 9 | 3.045 | More looping, hyperparam tuning, model size increase | 03/19/26 | ~44h (2 nodes, 8xH100) | [Script](https://github.com/qlabs-eng/slowrun/blob/fcfb67b230afcf2e1702936abc077defcf5f8657/unlimited/train.py) | [@akshayvegesna](https://x.com/akshayvegesna)
 10 | 3.024 | Use probability averaging over logit averaging, train 20 models | 03/31/26 | 210 hours (7xH100 node) | [Script](https://github.com/qlabs-eng/slowrun/blob/dceb3e9d5b6153058b8dadf36af84f6a7c622fdf/unlimited/train.py) | [@L-z-Chen](https://x.com/lzchen_ut)
+11 | 3.001 | Add MTP, IHA, MuonEq-R, adjust initialization, ensemble more models | 04/23/26 | 68 hours (4 nodes, 8xH100) | [Script](https://github.com/qlabs-eng/slowrun/blob/eed13a509d79d55553b6e0c71d6f7e386c5b3c4c/unlimited/train.py) | [@akshayvegesna](https://x.com/akshayvegesna)
 
 
 
