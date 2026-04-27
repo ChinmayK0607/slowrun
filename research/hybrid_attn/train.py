@@ -3,7 +3,13 @@ Train a language model on ~100M tokens with val loss evaluation.
 Code is based on Nanochat (https://github.com/karpathy/nanochat), with modifications to support the slowrun setting.
 
 Usage:
-   torchrun --standalone --nproc_per_node=8 train.py --gdn-layers "1,3,5,7,9,11,13,16,18,20,22,24,26,28"  
+   torchrun --standalone --nproc_per_node=8 train.py --gdn-layers "1,3,5,7,9,11,13,16,18,20,22,24,26,28"
+   Performance reference (8×H100, 12 epochs, alternating-14 layout):
+      Config: --gdn-layers 1,3,5,6,8,10,11,13,15,16,18,20,22,23 (14 GDN / 16 softmax)
+      Min val BPB: 1.053290                                                                                                                    
+      Min val Loss: 3.241282 
+      Total training time: 72.33m                                                                                                                                                              json                                       
+      Total wall time: 4614.82s (76.91m)     
 """
 
 import os
@@ -12,13 +18,13 @@ import gc
 import math
 import time
 import json
-import numpy as np
 import argparse
 from types import SimpleNamespace
 from functools import partial
 from dataclasses import dataclass
 from contextlib import nullcontext
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -64,6 +70,13 @@ parser.add_argument("--input_val_bin", type=str, default=None)
 parser.add_argument("--output_json", type=str, default=None)
 parser.add_argument("--wandb_group", type=str, default=None)
 parser.add_argument("--dropout", type=float, default=0.1)
+parser.add_argument("--muon-eq-r", action="store_true", dest="muon_eq_r", default=True,
+                    help="Enable MuonEq-R row normalization in the Muon path")
+parser.add_argument("--no-muon-eq-r", action="store_false", dest="muon_eq_r",
+                    help="Disable MuonEq-R row normalization in the Muon path")
+parser.add_argument("--muon-ns-schedule", type=str, default="polar-express",
+                    choices=("polar-express", "deepseek-v4"),
+                    help="Newton-Schulz coefficient schedule for Muon orthogonalization")
 parser.add_argument("--dupe-start-epoch", type=int, default=7,
                     help="Epoch to enable layer duplication")
 parser.add_argument("--dupe-layers-start", type=int, default=15,
@@ -80,6 +93,8 @@ parser.add_argument("--ema-start-frac", type=float, default=0.90,
                     help="Fraction of training after which to start EMA tracking")
 parser.add_argument("--checkpoint-avg", type=int, default=0,
                     help="Number of late checkpoints to average (0=disabled)")
+parser.add_argument("--grad-clip", type=float, default=0.0,
+                    help="Clip global grad norm before optimizer step (0=disabled)")
 parser.add_argument("--logit-cap", type=float, default=10.0,
                     help="Logit soft-capping value (0=disabled)")
 parser.add_argument("--gdn-layers", type=str, default="auto",
@@ -92,6 +107,8 @@ parser.add_argument("--gdn-profile", action="store_true",
                     help="Enable lightweight GDN timing attribution (runs in eager mode)")
 parser.add_argument("--linear-attn-type", type=str, default="gdn", choices=("gdn", "kda"),
                     help="Linear-attention block to use on the layers selected by --gdn-layers")
+parser.add_argument("--no-doc-shuffle", action="store_true",
+                    help="Disable per-epoch document reshuffling (still shuffles batch order)")
 args = parser.parse_args()
 
 # Resolve output path
@@ -115,6 +132,7 @@ DATA_DIR = _first_existing_path([
     os.path.abspath(os.path.join(_THIS_DIR, "..", "..", "fineweb_data")),
     os.path.abspath(os.path.join(_THIS_DIR, "..", "..", "..", "fineweb_data")),
 ])
+BOS_ID = 50256  # <|endoftext|>
 
 # Base optimizer hyperparameters
 BASE_MATRIX_LR = args.matrix_lr
@@ -835,7 +853,8 @@ class GPT(nn.Module):
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
             param_groups.append(dict(kind='muon', params=group_params, lr=MATRIX_LR,
-                                     momentum=0.95, ns_steps=5, beta2=0.95, weight_decay=WEIGHT_DECAY))
+                                     momentum=0.95, ns_steps=len(muon_ns_coeffs), beta2=0.95,
+                                     weight_decay=WEIGHT_DECAY, muon_eq_r=args.muon_eq_r))
 
         optimizer = DistMuonAdamW(param_groups)
         for group in optimizer.param_groups:
@@ -906,6 +925,16 @@ polar_express_coeffs = [
     (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
 ]
 
+deepseek_v4_ns_coeffs = (
+    [(3.4445, -4.7750, 2.0315)] * 8
+    + [(2.0, -1.5, 0.5)] * 2
+)
+
+muon_ns_coeffs = {
+    "polar-express": polar_express_coeffs,
+    "deepseek-v4": deepseek_v4_ns_coeffs,
+}[args.muon_ns_schedule]
+
 @torch.compile(dynamic=False, fullgraph=True)
 def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t):
     p.mul_(1 - lr_t * wd_t)
@@ -925,11 +954,11 @@ def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momen
     X = g.bfloat16()
     X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.02 + 1e-6)
     if g.size(-2) > g.size(-1):
-        for a, b, c in polar_express_coeffs[:ns_steps]:
+        for a, b, c in muon_ns_coeffs[:ns_steps]:
             A = X.mT @ X
             X = a * X + X @ (b * A + c * (A @ A))
     else:
-        for a, b, c in polar_express_coeffs[:ns_steps]:
+        for a, b, c in muon_ns_coeffs[:ns_steps]:
             A = X @ X.mT
             X = a * X + (b * A + c * (A @ A)) @ X
     g = X
@@ -946,6 +975,40 @@ def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momen
     final_scale = step_size * (v_norm / v_norm_new.clamp_min(1e-10))
     g = g * final_scale.to(g.dtype)
     # Cautious weight decay + update
+    lr = lr_t.to(g.dtype)
+    wd = wd_t.to(g.dtype)
+    mask = (g * stacked_params) >= 0
+    stacked_params.sub_(lr * g + lr * wd * stacked_params * mask)
+
+@torch.compile(dynamic=False, fullgraph=True)
+def muon_step_fused_eqr(stacked_grads, stacked_params, momentum_buffer, second_momentum_buffer,
+                        momentum_t, lr_t, wd_t, beta2_t, ns_steps, red_dim):
+    momentum = momentum_t.to(stacked_grads.dtype)
+    momentum_buffer.lerp_(stacked_grads, 1 - momentum)
+    g = stacked_grads.lerp_(momentum_buffer, momentum)
+    g /= g.float().norm(dim=-1, keepdim=True).clamp_min(1e-7).to(g.dtype)
+    X = g.bfloat16()
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.02 + 1e-6)
+    if g.size(-2) > g.size(-1):
+        for a, b, c in muon_ns_coeffs[:ns_steps]:
+            A = X.mT @ X
+            X = a * X + X @ (b * A + c * (A @ A))
+    else:
+        for a, b, c in muon_ns_coeffs[:ns_steps]:
+            A = X @ X.mT
+            X = a * X + (b * A + c * (A @ A)) @ X
+    g = X
+    beta2 = beta2_t.to(g.dtype)
+    v_mean = g.float().square().mean(dim=red_dim, keepdim=True)
+    red_dim_size = g.size(red_dim)
+    v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True) * red_dim_size
+    v_norm = v_norm_sq.sqrt()
+    second_momentum_buffer.lerp_(v_mean.to(dtype=second_momentum_buffer.dtype), 1 - beta2)
+    step_size = second_momentum_buffer.clamp_min(1e-10).rsqrt()
+    scaled_sq_sum = (v_mean * red_dim_size) * step_size.float().square()
+    v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt()
+    final_scale = step_size * (v_norm / v_norm_new.clamp_min(1e-10))
+    g = g * final_scale.to(g.dtype)
     lr = lr_t.to(g.dtype)
     wd = wd_t.to(g.dtype)
     mask = (g * stacked_params) >= 0
@@ -1045,10 +1108,11 @@ class DistMuonAdamW(torch.optim.Optimizer):
             self._muon_beta2_t.fill_(group["beta2"])
             self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
             self._muon_wd_t.fill_(group["weight_decay"])
-            muon_step_fused(info['grad_chunk'][:num_owned], owned,
-                          state["momentum_buffer"][:num_owned], state["second_momentum_buffer"][:num_owned],
-                          self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t, self._muon_beta2_t,
-                          group["ns_steps"], red_dim)
+            muon_step = muon_step_fused_eqr if group.get("muon_eq_r", False) else muon_step_fused
+            muon_step(info['grad_chunk'][:num_owned], owned,
+                      state["momentum_buffer"][:num_owned], state["second_momentum_buffer"][:num_owned],
+                      self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t, self._muon_beta2_t,
+                      group["ns_steps"], red_dim)
             updated[:num_owned].copy_(owned)
         if num_owned < chunk_size:
             updated[num_owned:].zero_()
@@ -1076,49 +1140,130 @@ class DistMuonAdamW(torch.optim.Optimizer):
 # =============================================================================
 
 class DataLoader:
-    """Pre-tokenized dataloader. Yields (inputs, targets, epoch) forever."""
+    """Pre-tokenized dataloader. Supports flat-token and legacy chunked datasets."""
 
-    def __init__(self, filepath, B, T, device="cuda"):
+    def __init__(self, filepath, B, T, device="cuda", doc_shuffle=False):
         data = torch.load(filepath, weights_only=True)
-        all_tokens = data["tokens"].long()
-        sequence_size = T + 1
+        chunked_keys = {"chunks", "valid_counts", "batch_size", "sequence_size"}
+        flat_keys = {"tokens", "doc_starts", "bos_id", "seq_shuffle_seed"}
 
-        # Reconstruct the old sequence ordering from flat tokens
-        num_seqs = len(all_tokens) // sequence_size
-        all_seqs = all_tokens[:num_seqs * sequence_size].view(num_seqs, sequence_size)
-        perm = np.random.RandomState(data["seq_shuffle_seed"]).permutation(num_seqs)
-        all_seqs = all_seqs[torch.from_numpy(perm)]  # (N, T+1)
-
-        # DDP sharding: each rank gets every world_size-th batch
         _, rank, _, world_size = get_dist_info()
-        seqs_per_step = B * world_size
-        num_steps = len(all_seqs) // seqs_per_step
-        usable = num_steps * seqs_per_step
-        all_seqs = all_seqs[:usable].view(num_steps, world_size, B, sequence_size)
-
-        self.rank_data = all_seqs[:, rank].contiguous()  # (num_steps, B, T+1)
-        self.num_steps = num_steps
-        self.total_tokens = usable * T  # trainable tokens across all ranks
+        self.rank = rank
+        self.world_size = world_size
         self.device = device
+        self.B = B
+        self.T = T
+        self.seq_size = T + 1
         self.pos = 0
         self.epoch = 1
+        self.data_format = "chunked"
+        self.doc_shuffle = False
+
+        if chunked_keys.issubset(data):
+            chunks = data["chunks"]
+            valid_counts = data["valid_counts"]
+            file_B = data["batch_size"]
+            sequence_size = data["sequence_size"]
+            assert sequence_size == self.seq_size, f"Data sequence_size {sequence_size} != T+1={T+1}"
+
+            all_seqs = []
+            for chunk, vc in zip(chunks, valid_counts):
+                rows = chunk.view(file_B, sequence_size)[:vc]
+                all_seqs.append(rows)
+            self.all_seqs = torch.cat(all_seqs, dim=0).long()
+            if doc_shuffle:
+                print0(
+                    f"Warning: {filepath} is a legacy chunked dataset; "
+                    "document shuffling is unavailable until the data is regenerated with prepare_data.py."
+                )
+            self._build_chunked_rank_data()
+            return
+
+        if not flat_keys.issubset(data):
+            found_keys = ", ".join(sorted(data.keys()))
+            raise ValueError(
+                f"{filepath} is not a recognized dataset format. "
+                f"Expected flat keys {sorted(flat_keys)} or chunked keys {sorted(chunked_keys)}, found [{found_keys}]."
+            )
+
+        if "seq_size" in data:
+            assert int(data["seq_size"]) == self.seq_size, f"Data seq_size {int(data['seq_size'])} != T+1={T+1}"
+        bos_id = int(data["bos_id"])
+        assert bos_id == BOS_ID, f"data bos_id {bos_id} != expected {BOS_ID}"
+
+        all_tokens = data["tokens"].long()
+        raw_doc_starts = data["doc_starts"].long()
+        doc_ends = torch.cat([raw_doc_starts[1:], torch.tensor([all_tokens.numel()])])
+        self.base_doc_tokens = [all_tokens[s:e] for s, e in zip(raw_doc_starts.tolist(), doc_ends.tolist())]
+        self.default_shuffle_seed = int(data["seq_shuffle_seed"])
+        self.data_format = "flat"
+        self.doc_shuffle = doc_shuffle
+        self._build_flat_rank_data()
+
+    def _build_chunked_rank_data(self):
+        seqs_per_step = self.B * self.world_size
+        num_steps = len(self.all_seqs) // seqs_per_step
+        usable = num_steps * seqs_per_step
+        all_seqs = self.all_seqs[:usable].view(num_steps, self.world_size, self.B, self.seq_size)
+        self.rank_data = all_seqs[:, self.rank].contiguous()
+        self.num_steps = num_steps
+        self.total_tokens = usable * self.T
+        self.pos = 0
+
+    def _build_flat_rank_data(self):
+        doc_tokens = self.base_doc_tokens
+        if self.doc_shuffle:
+            g = torch.Generator()
+            g.manual_seed(self.epoch)
+            perm = torch.randperm(len(self.base_doc_tokens), generator=g)
+            doc_tokens = [self.base_doc_tokens[i] for i in perm.tolist()]
+
+        tokens = torch.cat(doc_tokens)
+        num_seqs = len(tokens) // self.seq_size
+        all_seqs = tokens[:num_seqs * self.seq_size].view(num_seqs, self.seq_size)
+        if self.doc_shuffle:
+            g = torch.Generator()
+            g.manual_seed(self.epoch + 1000)
+            all_seqs = all_seqs[torch.randperm(num_seqs, generator=g)]
+        else:
+            perm = np.random.RandomState(self.default_shuffle_seed).permutation(num_seqs)
+            all_seqs = all_seqs[torch.from_numpy(perm)]
+
+        seqs_per_step = self.B * self.world_size
+        num_steps = len(all_seqs) // seqs_per_step
+        usable = num_steps * seqs_per_step
+        all_seqs = all_seqs[:usable].view(num_steps, self.world_size, self.B, self.seq_size)
+        self.rank_data = all_seqs[:, self.rank].contiguous()
+        self.num_steps = num_steps
+        self.total_tokens = usable * self.T
+        self.pos = 0
 
     def __iter__(self):
         return self
 
-    def _shuffle(self):
-        """Shuffle batch order for the new epoch, consistent across ranks."""
+    def _shuffle_chunked(self):
         g = torch.Generator()
         g.manual_seed(self.epoch)
         perm = torch.randperm(self.num_steps, generator=g)
         self.rank_data = self.rank_data[perm]
 
+    def _next_epoch(self):
+        self.epoch += 1
+        print0(f"Starting epoch {self.epoch}")
+        self.pos = 0
+        if self.data_format == "flat":
+            if self.doc_shuffle:
+                self._build_flat_rank_data()
+            else:
+                g = torch.Generator()
+                g.manual_seed(self.epoch)
+                self.rank_data = self.rank_data[torch.randperm(self.num_steps, generator=g)]
+        else:
+            self._shuffle_chunked()
+
     def __next__(self):
         if self.pos >= self.num_steps:
-            self.pos = 0
-            self.epoch += 1
-            print0(f"Starting epoch {self.epoch}")
-            self._shuffle()
+            self._next_epoch()
         batch = self.rank_data[self.pos].to(self.device, non_blocking=True)
         self.pos += 1
         return batch[:, :-1].contiguous(), batch[:, 1:].contiguous(), self.epoch
@@ -1212,7 +1357,10 @@ print0(f"  matrix_lr={MATRIX_LR}, scalar_lr={SCALAR_LR}, embedding_lr={EMBEDDING
 print0(f"  weight_decay={WEIGHT_DECAY}, adam_betas={ADAM_BETAS}")
 print0(f"  warmup_ratio={WARMUP_RATIO}, warmdown_ratio={WARMDOWN_RATIO}, final_lr_frac={FINAL_LR_FRAC}")
 print0(f"  num_epochs={args.num_epochs}, patience={args.patience}")
-print0(f"  dropout={args.dropout}")
+print0(f"  dropout={args.dropout}, doc_shuffle={not args.no_doc_shuffle}")
+print0(f"  grad_clip={args.grad_clip}")
+print0(f"  muon_eq_r={args.muon_eq_r}")
+print0(f"  muon_ns_schedule={args.muon_ns_schedule}")
 print0(f"  linear_attn_type={args.linear_attn_type}")
 print0(f"  gdn_no_conv={args.gdn_no_conv}, gdn_use_recurrent={args.gdn_use_recurrent}, gdn_profile={args.gdn_profile}")
 print0(f"-----------------------")
@@ -1332,7 +1480,7 @@ optimizer = model.setup_optimizer()
 # Dataloaders
 _train_path = args.input_bin if args.input_bin else os.path.join(DATA_DIR, "fineweb_train.pt")
 _val_path = args.input_val_bin if args.input_val_bin else os.path.join(DATA_DIR, "fineweb_val.pt")
-train_loader = DataLoader(_train_path, args.device_batch_size, MAX_SEQ_LEN, device=device)
+train_loader = DataLoader(_train_path, args.device_batch_size, MAX_SEQ_LEN, device=device, doc_shuffle=not args.no_doc_shuffle)
 build_val_loader = lambda: DataLoader(_val_path, args.device_batch_size, MAX_SEQ_LEN, device=device)
 TOKENS_PER_EPOCH = train_loader.total_tokens
 x, y, current_epoch = next(train_loader)
@@ -1415,6 +1563,9 @@ while current_epoch <= args.num_epochs:
         x, y, epoch = next(train_loader)
 
     # Update optimizer
+    grad_norm = None
+    if args.grad_clip > 0:
+        grad_norm = torch.nn.utils.clip_grad_norm_(orig_model.parameters(), args.grad_clip)
     lrm = get_lr_multiplier(step)
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm
@@ -1451,7 +1602,10 @@ while current_epoch <= args.num_epochs:
     eta_str = f" | eta: {(num_iterations - step) * total_training_time / timed_steps / 60:.1f}m" if timed_steps > 0 else ""
     dupe_str = " [DUPE]" if dupe_active else ""
     print0(f"step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f} | dt: {dt*1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}%{dupe_str}{eta_str}")
-    wandb_run.log({"step": step, "train/loss": debiased, "train/mfu": mfu})
+    log_dict = {"step": step, "train/loss": debiased, "train/mfu": mfu}
+    if grad_norm is not None:
+        log_dict["train/grad_norm"] = grad_norm.item()
+    wandb_run.log(log_dict)
 
     # Synchronize epoch across ranks (different ranks may exhaust data at different steps)
     if ddp:
@@ -1567,6 +1721,9 @@ if args.save_result and master_process:
         "matrix_lr": args.matrix_lr,
         "weight_decay": args.weight_decay,
         "num_epochs": args.num_epochs,
+        "grad_clip": args.grad_clip,
+        "muon_eq_r": args.muon_eq_r,
+        "muon_ns_schedule": args.muon_ns_schedule,
         "input_bin": _train_path,
         "input_val_bin": _val_path,
         "val_loss": val_loss,
