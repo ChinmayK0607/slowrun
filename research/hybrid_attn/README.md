@@ -1,4 +1,4 @@
-````md
+
 # Hybrid Attention
 
 Hybrid attention track led by [@ChinmayK0607](https://x.com/ChinmayKak).
