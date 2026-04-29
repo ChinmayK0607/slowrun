@@ -37,7 +37,7 @@ _script_start = time.time()
 
 parser = argparse.ArgumentParser(description="Train GPT model")
 parser.add_argument("--device-batch-size", type=int, default=4)
-parser.add_argument("--num-epochs", type=int, default=11)
+parser.add_argument("--num-epochs", type=int, default=22)
 parser.add_argument("--patience", type=int, default=-1)
 parser.add_argument("--run", type=str, default=None)
 parser.add_argument("--scalar-lr", type=float, default=0.1)
@@ -54,7 +54,7 @@ parser.add_argument("--input_val_bin", type=str, default=None)
 parser.add_argument("--output_json", type=str, default=None)
 parser.add_argument("--wandb_group", type=str, default=None)
 parser.add_argument("--dropout", type=float, default=0.1)
-parser.add_argument("--dupe-start-epoch", type=int, default=7,
+parser.add_argument("--dupe-start-epoch", type=int, default=14,
                     help="Epoch to enable layer duplication")
 parser.add_argument("--dupe-layers-start", type=int, default=15,
                     help="First decoder layer to duplicate (inclusive)")
@@ -66,7 +66,7 @@ parser.add_argument("--warmdown-ratio", type=float, default=None,
                     help="Override warmdown ratio (default 0.2)")
 parser.add_argument("--logit-cap", type=float, default=10.0,
                     help="Logit soft-capping value (0=disabled)")
-parser.add_argument("--logit-avg", type=int, default=3,
+parser.add_argument("--logit-avg", type=int, default=11,
                     help="Number of late checkpoints for logit (probability) averaging (0=disabled)")
 parser.add_argument("--logit-avg-dir", type=str, default="logit_avg_ckpts",
                     help="Directory to save/load epoch checkpoints for logit averaging")
@@ -75,7 +75,7 @@ parser.add_argument("--logit-avg-mode", type=str, default="both",
                     help="Weight scheme: equal, linear recency weighted, or compare both")
 parser.add_argument("--eval-logit-avg", action="store_true",
                     help="Skip training and only run logit-avg eval on saved checkpoints")
-parser.add_argument("--swa-last-epochs", type=int, default=3,
+parser.add_argument("--swa-last-epochs", type=int, default=8,
                     help="SWA: cosine-cycle LR in last N epochs for checkpoint diversity (0=off)")
 parser.add_argument("--stoch-depth", type=float, default=0.05,
                     help="Stochastic depth max drop rate (linear schedule, 0=off)")
@@ -129,6 +129,10 @@ ADAM_BETAS = (0.8, 0.95)
 WARMUP_RATIO = 0.0
 WARMDOWN_RATIO = args.warmdown_ratio if args.warmdown_ratio is not None else 0.2
 FINAL_LR_FRAC = 0.0
+WARMDOWN_POWER = 0.5      # sqrt-shaped warmdown (stays ~41% higher at midpoint than linear)
+WD_PRE_HOLD_FRAC = 0.40   # hold at base WD for first 40% of training, then decay to LOW by SWA start
+WD_SWA_LOW_FACTOR = 0.65  # WD at start of each SWA epoch (LR is high → less regularization)
+WD_SWA_HIGH_FACTOR = 1.50 # WD at end of each SWA epoch (LR has decayed → more regularization)
 LOGIT_CAP = args.logit_cap
 
 
@@ -1153,13 +1157,28 @@ def get_lr_multiplier(it):
     elif it <= num_iterations - warmdown: return 1.0
     else:
         progress = (num_iterations - it) / warmdown
-        return progress + (1 - progress) * FINAL_LR_FRAC
+        shaped = progress ** WARMDOWN_POWER  # concave (stays higher longer) when POWER < 1
+        return shaped + (1 - shaped) * FINAL_LR_FRAC
 
 def get_muon_momentum(it):
     return (1 - min(it / 300, 1)) * 0.85 + min(it / 300, 1) * 0.95
 
 steps_per_epoch = num_iterations / args.num_epochs
 _swa_start_step = (num_iterations - args.swa_last_epochs * steps_per_epoch) if args.swa_last_epochs > 0 else -1
+
+def get_wd_multiplier(it):
+    """Anti-phase WD: hold at 1.0 pre-SWA, decay to LOW by SWA start, then sawtooth LOW→HIGH per SWA epoch (anti-phase with the LR cosine cycle)."""
+    if _swa_start_step >= 0 and it >= _swa_start_step:
+        cycle_pos = (it - _swa_start_step) % steps_per_epoch
+        frac = cycle_pos / steps_per_epoch
+        return WD_SWA_LOW_FACTOR + (WD_SWA_HIGH_FACTOR - WD_SWA_LOW_FACTOR) * frac
+    t = it / num_iterations
+    if t < WD_PRE_HOLD_FRAC:
+        return 1.0
+    swa_start_frac = _swa_start_step / num_iterations if _swa_start_step > 0 else 1.0
+    decay_frac = (t - WD_PRE_HOLD_FRAC) / max(swa_start_frac - WD_PRE_HOLD_FRAC, 1e-6)
+    decay_frac = min(max(decay_frac, 0.0), 1.0)
+    return 1.0 - (1.0 - WD_SWA_LOW_FACTOR) * decay_frac
 
 # Training loop
 step = 0
@@ -1221,8 +1240,14 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
         cycle_pos = (step - _swa_start_step) % steps_per_epoch
         swa_base = max(lrm, 0.05)
         lrm = 0.05 + (swa_base - 0.05) * (1 + math.cos(math.pi * cycle_pos / steps_per_epoch)) / 2
+    # WD schedule: pre-SWA decay from base to 0.65×base, then anti-phase sawtooth
+    # during SWA's N epochs (0.65→1.50×base per epoch, anti-phase with LR cosine cycle).
+    wdm = get_wd_multiplier(step)
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm
+        if "initial_wd" not in group:
+            group["initial_wd"] = group.get("weight_decay", 0.0)
+        group["weight_decay"] = group["initial_wd"] * wdm
         if group['kind'] == 'muon':
             group["momentum"] = get_muon_momentum(step)
     optimizer.step()
