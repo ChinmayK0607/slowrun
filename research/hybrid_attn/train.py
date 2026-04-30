@@ -99,6 +99,9 @@ parser.add_argument("--logit-cap", type=float, default=10.0,
                     help="Logit soft-capping value (0=disabled)")
 parser.add_argument("--gdn-layers", type=str, default="auto",
                     help="Comma-separated layer indices for GatedDeltaNet, or 'auto' for all-but-first-last-every-7th, or 'none'")
+parser.add_argument("--gdn-head-dim-mode", type=str, default="param-matched",
+                    choices=("param-matched", "square"),
+                    help="GDN key-head geometry: param-matched uses K=d_head/2, square uses K=d_head")
 parser.add_argument("--gdn-no-conv", action="store_true",
                     help="Disable GDN short convolutions and use the projection-only fast path")
 parser.add_argument("--gdn-use-recurrent", action="store_true",
@@ -312,6 +315,7 @@ class GPTConfig:
     window_pattern: str = WINDOW_PATTERN
     dropout: float = 0.0
     gdn_layers: list = None  # layer indices that use GatedDeltaNet (None = all softmax)
+    gdn_head_dim_mode: str = "param-matched"
     gdn_no_conv: bool = False
     gdn_use_recurrent: bool = False
     gdn_profile: bool = False
@@ -372,16 +376,16 @@ class GatedDeltaNetAttention(nn.Module):
     """Gated Delta Net linear attention with negative eigenvalues.
     Paper: https://arxiv.org/abs/2412.06464
     Uses Mamba2-style forget gate + delta rule with beta in [0,2].
-    Param-matched to standard attention: ~4*d^2 per layer.
+    Param-matched mode stays close to ~4*d^2 per layer.
     """
     def __init__(self, config, layer_idx):
         super().__init__()
         self.n_embd = config.n_embd
         self.num_heads = config.n_head
-        self.head_k_dim = config.n_embd // config.n_head // 2  # 64 for d=1792, h=14
-        self.head_v_dim = config.n_embd // config.n_head        # 128 for d=1792, h=14
-        self.key_dim = self.num_heads * self.head_k_dim          # 896
-        self.value_dim = self.num_heads * self.head_v_dim        # 1792
+        self.head_v_dim = config.n_embd // config.n_head
+        self.head_k_dim = self.head_v_dim if config.gdn_head_dim_mode == "square" else self.head_v_dim // 2
+        self.key_dim = self.num_heads * self.head_k_dim
+        self.value_dim = self.num_heads * self.head_v_dim
         self.layer_idx = layer_idx
         self.use_short_conv = not config.gdn_no_conv
         self.use_recurrent = config.gdn_use_recurrent
@@ -1362,6 +1366,7 @@ print0(f"  grad_clip={args.grad_clip}")
 print0(f"  muon_eq_r={args.muon_eq_r}")
 print0(f"  muon_ns_schedule={args.muon_ns_schedule}")
 print0(f"  linear_attn_type={args.linear_attn_type}")
+print0(f"  gdn_head_dim_mode={args.gdn_head_dim_mode}")
 print0(f"  gdn_no_conv={args.gdn_no_conv}, gdn_use_recurrent={args.gdn_use_recurrent}, gdn_profile={args.gdn_profile}")
 print0(f"-----------------------")
 
@@ -1369,6 +1374,8 @@ if args.gdn_profile:
     print0("GDN profiling enabled; running in eager mode to keep section timings meaningful")
 if args.gdn_use_recurrent:
     print0("Experimental recurrent GDN kernel requested; chunk-kernel fallback remains enabled")
+if args.gdn_head_dim_mode != "param-matched" and args.linear_attn_type != "gdn":
+    raise RuntimeError("--gdn-head-dim-mode only applies to --linear-attn-type gdn")
 if args.linear_attn_type == "kda" and args.gdn_use_recurrent:
     raise RuntimeError("--gdn-use-recurrent is only implemented for --linear-attn-type gdn")
 if args.linear_attn_type == "kda" and HEAD_DIM != 128:
@@ -1450,6 +1457,7 @@ config = GPTConfig(
     vocab_size=vocab_size,
     dropout=args.dropout,
     gdn_layers=gdn_layer_indices,
+    gdn_head_dim_mode=args.gdn_head_dim_mode,
     gdn_no_conv=args.gdn_no_conv,
     gdn_use_recurrent=args.gdn_use_recurrent,
     gdn_profile=args.gdn_profile,
@@ -1734,6 +1742,7 @@ if args.save_result and master_process:
         "total_training_time_min": total_training_time / 60,
         "total_wall_time_sec": time.time() - _script_start,
         "peak_memory_mib": peak_memory_mib,
+        "gdn_head_dim_mode": args.gdn_head_dim_mode,
         "gdn_no_conv": args.gdn_no_conv,
         "gdn_use_recurrent": args.gdn_use_recurrent,
         "gdn_profile": args.gdn_profile,
