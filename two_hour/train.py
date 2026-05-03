@@ -3,7 +3,7 @@ Train a language model on ~100M tokens with val loss evaluation.
 Code is based on Nanochat (https://github.com/karpathy/nanochat), with modifications to support the slowrun setting.
 
 Usage:
-    torchrun --standalone --nproc_per_node=8 train.py
+    torchrun --standalone --nproc_per_node=8 two_hour/train.py 
 """
 
 import os
