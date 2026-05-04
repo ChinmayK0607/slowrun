@@ -87,7 +87,7 @@ parser.add_argument("--no-iha", action="store_false", dest="iha",
                     help="Disable IHA cross-head mixing")
 parser.add_argument("--iha-lr", type=float, default=0.02,
                     help="LR for IHA mixing matrices")
-parser.add_argument("--window-schedule", type=str, default="",
+parser.add_argument("--window-schedule", type=str, default="1-6:256,768;7-13:768,1792;14-22:1280,2048",
                     help="Epoch-window schedule 'start-end:short,long;...'. Applies YaRN on long-window expansions.")
 args = parser.parse_args()
 args.window_schedule_spec = args.window_schedule.strip()
